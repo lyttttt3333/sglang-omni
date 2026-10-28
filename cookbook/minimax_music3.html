@@ -535,7 +535,10 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#guidance">Guidance</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#concurrency">Concurrency</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#concurrency">Concurrency</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fp32-flex-attention">FP32 flex attention</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-parameters">Request Parameters</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#parameters-that-the-model-rejects">Parameters That The Model Rejects</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#notes">Notes</a></li>
@@ -1134,6 +1137,14 @@ curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </spa
 </pre></div>
 </div>
 <p>That serves 32 concurrent requests as 64 rows. Do not pass <code class="docutils literal notranslate"><span class="pre">engine.cuda_graph_max_bs</span></code> here: this model computes the cap itself so the graphs always cover the doubled batch, and a value you supply is discarded rather than honoured.</p>
+<section id="fp32-flex-attention">
+<h3>FP32 flex attention<a class="headerlink" href="#fp32-flex-attention" title="Link to this heading">#</a></h3>
+<p>On CUDA, the default FP32 acoustic DIT uses PyTorch flex attention while retaining FP32 inputs and TF32 matmuls. To restore the previous SDPA path:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">CUDA_VISIBLE_DEVICES</span><span class="o">=</span><span class="m">0</span>,1<span class="w"> </span>sgl-omni<span class="w"> </span>serve<span class="w"> </span>--model-path<span class="w"> </span>MiniMaxAI/MiniMax-Music3<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dit_dav.factory.fp32_flex_attention<span class="w"> </span><span class="nb">false</span>
+</pre></div>
+</div>
+<p>The option resolves to flex attention only on CUDA with <code class="docutils literal notranslate"><span class="pre">dtype=float32</span></code> and <code class="docutils literal notranslate"><span class="pre">attention_backend=torch_sdpa</span></code>; MUSA, XPU, and other dtype/backend combinations retain their existing attention path. Flex-attention output is not byte-identical to SDPA, so validate generated audio for your workload when comparing the two paths.</p>
 <p>Send clients in parallel rather than in sequence:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">ThreadPoolExecutor</span>
 
@@ -1170,6 +1181,7 @@ curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </spa
 </div>
 <p>Concurrency is where this model is most efficient. The depth decoder costs the same per step whether one request or eight share the batch, so its per-request share falls as concurrency rises.</p>
 <p>That flatness is also why guidance is cheap in time and expensive in memory. The AR step is bound by reading the backbone’s weights rather than by arithmetic, so the second row rides along in the same pass with little extra wall time, while doubling the KV each request holds. Size the pool for the rows, not the requests.</p>
+</section>
 </section>
 <section id="request-parameters">
 <h2>Request Parameters<a class="headerlink" href="#request-parameters" title="Link to this heading">#</a></h2>
@@ -1324,7 +1336,10 @@ curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </spa
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#guidance">Guidance</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#concurrency">Concurrency</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#concurrency">Concurrency</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fp32-flex-attention">FP32 flex attention</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-parameters">Request Parameters</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#parameters-that-the-model-rejects">Parameters That The Model Rejects</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#notes">Notes</a></li>
