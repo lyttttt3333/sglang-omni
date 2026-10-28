@@ -341,6 +341,25 @@ def run_sessions(
     return runtime, waveforms
 
 
+@pytest.mark.parametrize(
+    "talker_tokens", [CODEC_CHUNK_SIZE + 1, 10], ids=["full-unit", "short-unit"]
+)
+def test_reply_audio_starts_with_its_first_decoded_frame(talker_tokens: int) -> None:
+    """A reply's first unit carries decoded audio from its first sample; leading padding would delay every reply's audible onset."""
+    runtime = MiniCPMOVocoderRuntime(
+        TinyCode2Wav(tiny_token2wav()),
+        max_state_bytes_per_session=DEFAULT_SPEECH_STATE_BYTES_PER_SESSION,
+        max_open_sessions=1,
+    )
+    runtime.open_session("0", reference_audio=b"0")
+
+    ((_, first_unit),) = runtime.synthesize_batch(
+        [unit(0, 0, talker_tokens, True, False)]
+    )
+
+    assert np.all(first_unit[:SAMPLES_PER_MEL_FRAME] != 0)
+
+
 def test_sessions_decoded_together_match_each_session_alone() -> None:
     token2wav = tiny_token2wav()
     # note (Junnan Li): Two warm-up chunks reach exactly the prompt plus the kept tail, so session 2's next chunk is its first trimmed one.
