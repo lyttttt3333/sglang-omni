@@ -79,9 +79,9 @@ class WireEvent(BaseModel):
     error: dict[str, JsonValue] | None = None
 
 
-def turn_detection_type(session: JsonValue, protocol: Protocol) -> JsonValue:
-    """turn_detection.type of a session object: top-level on the legacy protocol,
-    under audio.input on the turn-based one; None when absent."""
+def session_turn_detection(session: JsonValue, protocol: Protocol) -> JsonValue:
+    """turn_detection of a session object: top-level on the legacy protocol, under
+    audio.input on the turn-based one; None when absent."""
     fields = session if isinstance(session, dict) else {}
     if protocol == "turn_based":
         audio = fields.get("audio")
@@ -89,7 +89,12 @@ def turn_detection_type(session: JsonValue, protocol: Protocol) -> JsonValue:
         fields = audio_input if isinstance(audio_input, dict) else {}
     else:
         pass
-    turn = fields.get("turn_detection")
+    return fields.get("turn_detection")
+
+
+def turn_detection_type(session: JsonValue, protocol: Protocol) -> JsonValue:
+    """turn_detection.type of a session object; None when absent."""
+    turn = session_turn_detection(session, protocol)
     return turn.get("type") if isinstance(turn, dict) else None
 
 

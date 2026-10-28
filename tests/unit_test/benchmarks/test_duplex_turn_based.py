@@ -400,6 +400,7 @@ def test_profile_declares_the_turn_based_protocol() -> None:
         stop_requires_eos=False,
         continuous_output=False,
         protocol="turn_based",
+        playout_cuts=frozenset({"response.done"}),
     )
 
 
@@ -1106,6 +1107,8 @@ def make_turn_based_run(
     verdicts: dict[str, str] | None = None,
     done_at_s: float | None = None,
     done_status: str = "cancelled",
+    speech_at_s: float | None = None,
+    turn_detection: dict[str, JsonValue] | None = None,
 ) -> Path:
     """A paired capture whose traces speak the turn-based protocol at 24 kHz."""
     run = root / "run"
@@ -1119,7 +1122,7 @@ def make_turn_based_run(
             {
                 "type": "session.update",
                 "event_id": "configure",
-                "session": configure({"type": "server_vad"}),
+                "session": configure(turn_detection or {"type": "server_vad"}),
             },
         ),
         (
@@ -1169,6 +1172,16 @@ def make_turn_based_run(
                 },
             )
         )
+    if speech_at_s is not None:
+        rows.append(
+            (
+                1000 + speech_at_s,
+                "receive",
+                {"type": "input_audio_buffer.speech_started", "audio_start_ms": 0},
+            )
+        )
+    else:
+        pass
     if done_at_s is not None:
         rows.append(
             (
@@ -1262,6 +1275,46 @@ def test_export_cuts_the_window_at_a_cancelled_response(
     overlap = result["samples"][0]["variants"]["overlap"]
     assert overlap["eligible"] is True
     cut = status == "cancelled"
+    assert overlap["output"]["barge_in_cuts"] == int(cut)
+    audio, _ = soundfile.read(
+        tmp_path / "export/user_interruption/1/output.wav", dtype="int16"
+    )
+    assert audio[1700:3100].min() > 900
+    if cut:
+        assert not audio[3300:].any()
+    else:
+        assert audio[3300:6300].min() > 900
+
+
+@pytest.mark.parametrize(
+    ("profile", "turn_detection", "cut"),
+    [
+        ("openai-realtime", {"type": "server_vad"}, True),
+        ("openai-realtime", {"type": "server_vad", "interrupt_response": False}, False),
+        (TURN_BASED, {"type": "server_vad"}, False),
+    ],
+    ids=["openai-realtime", "interrupt-response-false", "turn-based"],
+)
+def test_export_cuts_the_window_at_speech_started_where_the_profile_does(
+    tmp_path: Path, profile: str, turn_detection: dict[str, JsonValue], cut: bool
+) -> None:
+    run = make_turn_based_run(
+        tmp_path,
+        samples(8000, 0),
+        profile=profile,
+        speech_at_s=0.2,
+        turn_detection=turn_detection,
+    )
+
+    result = export_runs(
+        [run],
+        tmp_path / "export",
+        profile,
+        trace_format="realtime-turn-based-pcm16-v1",
+    )
+
+    overlap = result["samples"][0]["variants"]["overlap"]
+    assert overlap["eligible"] is True
     assert overlap["output"]["barge_in_cuts"] == int(cut)
     audio, _ = soundfile.read(
         tmp_path / "export/user_interruption/1/output.wav", dtype="int16"
@@ -1463,6 +1516,32 @@ def test_v10_export_reads_a_turn_based_run_at_the_profile_rate(
         tmp_path / "export/synthetic_user_interruption/1/output.wav", dtype="int16"
     )
     assert rate == INPUT_RATE
+
+
+@pytest.mark.parametrize(("profile", "cuts"), [("openai-realtime", 1), (TURN_BASED, 0)])
+def test_v10_export_cuts_at_speech_started_where_the_profile_does(
+    tmp_path: Path, profile: str, cuts: int
+) -> None:
+    dataset, run = record_v10_interruption(tmp_path)
+    manifest_path = run / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({**json.loads(manifest_path.read_text()), "profile": profile})
+    )
+    (trace_path,) = run.rglob("continuous.jsonl")
+    # note (wenyao): with the server's cancel turned into a completion, only a cut at
+    # speech_started can stop the reply still playing at the barge-in.
+    records = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    for record in records:
+        if (record["event"].get("response") or {}).get("status") == "cancelled":
+            record["event"]["response"]["status"] = "completed"
+        else:
+            pass
+    write_trace(trace_path, records)
+
+    manifest = export_v10_turn_based(dataset, run, tmp_path / "export")
+
+    [row] = manifest["samples"]
+    assert row["output"]["barge_in_cuts"] == cuts
 
 
 def test_v10_export_needs_a_passing_turn_based_protocol_verdict(

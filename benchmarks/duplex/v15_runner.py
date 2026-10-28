@@ -23,7 +23,7 @@ from benchmarks.duplex.client import (
     LEGACY_TRANSPORT,
     MAX_TIMEOUT_S,
     PACKET_MS,
-    PLAYBACK_REPORT,
+    PLAYBACK_REPORTS,
     SAMPLE_RATE,
     TRANSPORT,
     TURN_BASED_TRANSPORT,
@@ -31,12 +31,12 @@ from benchmarks.duplex.client import (
     profile_protocol,
     run_session,
 )
+from benchmarks.duplex.openai_client import provider_manifest
 from benchmarks.duplex.profiles import DEFAULT_PROFILE, PROFILES, ProfileName
 from benchmarks.duplex.v10_dataset import Sample as V10Sample
 from benchmarks.duplex.v15_audio import (
-    LEGACY_BARGE_IN_CUT,
+    BARGE_IN_CUTS,
     PACING_TOLERANCE_S,
-    TURN_BASED_BARGE_IN_CUT,
     normalize_audio,
     reconstruct_output,
     write_json,
@@ -51,6 +51,7 @@ RUNNER_FILES = (
     "benchmarks/duplex/v15_audio.py",
     "benchmarks/duplex/v15_dataset.py",
     "benchmarks/duplex/v15_runner.py",
+    "benchmarks/duplex/openai_client.py",
 )
 VARIANT_STATUSES = ("pending", "invalid", "error", "fail", "not_exercised", "pass")
 
@@ -193,7 +194,7 @@ async def run_samples(
         {
             "turn_detection": turn_detection.model_dump(mode="json"),
             "tail_s": legacy_tail_s,
-            "barge_in_cut": LEGACY_BARGE_IN_CUT,
+            "barge_in_cut": BARGE_IN_CUTS[PROFILES[profile].playout_cuts],
             **LEGACY_TRANSPORT,
         }
         if legacy
@@ -206,13 +207,18 @@ async def run_samples(
     turn_based_config = (
         {
             "turn_detection": turn_detection.model_dump(mode="json"),
-            "barge_in_cut": TURN_BASED_BARGE_IN_CUT,
-            "playback_report": PLAYBACK_REPORT if report_playback else None,
+            "barge_in_cut": BARGE_IN_CUTS[PROFILES[profile].playout_cuts],
+            "playback_report": (
+                PLAYBACK_REPORTS[PROFILES[profile].playout_cuts]
+                if report_playback
+                else None
+            ),
             **TURN_BASED_TRANSPORT,
         }
         if protocol == "turn_based"
         else None
     )
+    provider = provider_manifest(profile, url)
     end_of_input = {
         "tail_silence_s": tail_silence_s,
         "end_wait_s": end_wait_s,
@@ -289,6 +295,7 @@ async def run_samples(
                 "legacy": legacy_config,
                 "turn_based": turn_based_config,
                 "end_of_input": end_of_input,
+                **({"provider": provider} if provider is not None else {}),
             },
             "samples": [
                 {
@@ -382,6 +389,7 @@ async def run_samples(
                             "legacy": legacy_config,
                             "turn_based": turn_based_config,
                             "end_of_input": end_of_input,
+                            **({"provider": provider} if provider is not None else {}),
                         },
                         "input": {
                             "file": "input.pcm",

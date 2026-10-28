@@ -153,6 +153,7 @@ def main() -> None:
             model=args.model,
             model_revision=args.model_revision,
             runtime=args.runtime,
+            profile=args.profile,
         )
     except ValueError as exc:
         parser.error(str(exc))

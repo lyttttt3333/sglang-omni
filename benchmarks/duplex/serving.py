@@ -50,6 +50,12 @@ def score_session(
     variant_dir: Path, profile: ProfileName, playback_reserve_s: float
 ) -> dict[str, JsonValue]:
     """Compute 'Unit lag', 'deadline misses' and 'per-reply audio timing' as the client saw them."""
+    if PROFILES[profile].wire == "openai-live":
+        raise ValueError(
+            "openai-live sessions have no unit receipts or reply IDs to score"
+        )
+    else:
+        pass
     unit_ms = PROFILES[profile].native_unit_ms
     output_sample_rate = PROFILES[profile].output_sample_rate
     is_native = PROFILES[profile].protocol == "native"

@@ -310,6 +310,9 @@ def test_profiles_declare_their_protocol() -> None:
         stop_requires_eos=False,
         continuous_output=False,
         protocol="legacy",
+        playout_cuts=frozenset(
+            {"output_audio_buffer.cleared", "input_audio_buffer.speech_started"}
+        ),
     )
     assert asdict(PROFILES["nemotron-voicechat-pr2188"]) == {
         "native_unit_ms": 80,
@@ -317,6 +320,8 @@ def test_profiles_declare_their_protocol() -> None:
         "stop_requires_eos": True,
         "continuous_output": True,
         "protocol": "native",
+        "wire": "sglang",
+        "playout_cuts": frozenset(),
     }
     assert asdict(PROFILES[NATIVE]) == {
         "native_unit_ms": 1000,
@@ -324,6 +329,8 @@ def test_profiles_declare_their_protocol() -> None:
         "stop_requires_eos": False,
         "continuous_output": False,
         "protocol": "native",
+        "wire": "sglang",
+        "playout_cuts": frozenset(),
     }
 
 

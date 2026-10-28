@@ -31,6 +31,7 @@ def record(args: argparse.Namespace) -> int:
                 model=args.model,
                 model_revision=args.model_revision,
                 runtime=args.runtime,
+                profile=args.profile,
             ),
             dataset_revision=args.dataset_revision,
             timeout_s=args.timeout,

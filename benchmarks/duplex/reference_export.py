@@ -115,6 +115,11 @@ def export_runs(
                 receipts_required=sidecar,
                 profile_rate=profile_rate,
                 tail_appends=tail_appends(source_manifest),
+                playout_cuts=(
+                    PROFILES[source_manifest["profile"]].playout_cuts
+                    if capture_format is not TraceFormat.PCM16
+                    else frozenset()
+                ),
             )
             reasons = record["window"]["reasons"]
             # note (luojiaxuan): A legacy or turn-based session that failed its

@@ -17,12 +17,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 from benchmarks.duplex.client import LEGACY_TAIL_S, SAMPLE_RATE, TurnDetection
+from benchmarks.duplex.openai_client import provider_manifest, served_model
 from benchmarks.duplex.oracle import evaluate_trace
 from benchmarks.duplex.oracle_models import TraceRecord
 from benchmarks.duplex.profiles import DEFAULT_PROFILE, PROFILES, ProfileName
@@ -57,6 +59,7 @@ class RunManifest(BaseModel):
 
 
 HARNESS_PACKAGES = ("websockets", "numpy", "pydantic", "soundfile")
+PROVIDER_IDENTITY_FIELDS = ("wire", "url", "model", "voice", "instructions_sha256")
 SHA_PATTERN = r"[0-9a-f]{40}"
 
 
@@ -70,8 +73,8 @@ def package_version(name: str) -> str | None:
 def add_server_identity_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--server-revision",
-        required=True,
-        help="Operator-supplied full server commit SHA",
+        help="Operator-supplied full server commit SHA; required by sglang-wire "
+        "profiles, unused by OpenAI ones",
     )
     parser.add_argument(
         "--model", required=True, help="Operator-supplied served model path or ID"
@@ -146,12 +149,29 @@ def served_models(url: str) -> dict[str, JsonValue]:
 def server_identity(
     url: str,
     *,
-    revision: str,
+    revision: str | None,
     model: str,
     model_revision: str | None = None,
     runtime: str | None = None,
+    profile: ProfileName = DEFAULT_PROFILE,
 ) -> dict[str, JsonValue]:
-    if not re.fullmatch(SHA_PATTERN, revision):
+    provider = provider_manifest(profile, url)
+    if provider is not None:
+        # note (wenyao): A provider API has no commit to pin, so its settings, the
+        # recording date and the account's answer for the model identify the run.
+        if model != provider["model"]:
+            raise ValueError(
+                f"model {model!r} differs from the provider model {provider['model']!r}"
+            )
+        else:
+            return {
+                "identity_source": "provider_api",
+                **{field: provider[field] for field in PROVIDER_IDENTITY_FIELDS},
+                "runtime": runtime,
+                "recorded_date": datetime.now(timezone.utc).date().isoformat(),
+                "served_model": served_model(profile, url),
+            }
+    elif revision is None or not re.fullmatch(SHA_PATTERN, revision):
         raise ValueError("server revision must be a full lowercase commit SHA")
     else:
         pass

@@ -14,7 +14,9 @@ from numpy.typing import NDArray
 from pydantic import JsonValue
 from scipy.signal import resample_poly
 
-from benchmarks.duplex.profiles import PROFILES
+from benchmarks.duplex.client import session_cuts, stops_playout
+from benchmarks.duplex.oracle_models import session_turn_detection
+from benchmarks.duplex.profiles import PROFILES, PlayoutCut
 from benchmarks.duplex.reference_capture import (
     AUDIO_DELTA,
     FORMAT_PROTOCOL,
@@ -150,10 +152,12 @@ def analyze_variant(
     receipts_required: bool = False,
     profile_rate: int | None = None,
     tail_appends: int = 0,
+    playout_cuts: frozenset[PlayoutCut] = frozenset(),
 ) -> tuple[dict[str, JsonValue], bytes | None, NDArray[np.int16] | None]:
     """Stream one trace; return (record, input_pcm or None, output int16 at 16 kHz or None).
 
     profile_rate is the recorded profile's output rate for the legacy format;
+    playout_cuts are the recorded profile's, applied as v15_audio applies them;
     tail_appends counts the tail-silence appends after the input, which fall
     after the scoring window and are not checked against input.pcm.
     """
@@ -202,7 +206,10 @@ def analyze_variant(
     }
     first_audio_s = last_audio_s = None
     live_after_t = False
-    interrupts_on_speech = None
+    # note (wenyao): speech_started cuts only once the session.update shows the
+    # server interrupts on speech.
+    cut_events = playout_cuts - {"input_audio_buffer.speech_started"}
+    configured = False
     barge_in_cuts = 0
     created_responses, response_terminals = set(), {}
     closed_count, close_times_s = 0, []
@@ -289,14 +296,13 @@ def analyze_variant(
                     accepted_receipts.setdefault(f"sent:{kind}", at(time_s))
                 else:
                     pass
-                if (
-                    trace_format is TraceFormat.LEGACY_PCM16
-                    and kind == "session.update"
-                    and interrupts_on_speech is None
-                ):
-                    turn_detection = event["session"].get("turn_detection") or {}
-                    interrupts_on_speech = (
-                        turn_detection.get("interrupt_response") is not False
+                if kind == "session.update" and not configured:
+                    configured = True
+                    cut_events = session_cuts(
+                        playout_cuts,
+                        session_turn_detection(
+                            event.get("session"), FORMAT_PROTOCOL[trace_format]
+                        ),
                     )
                 else:
                     pass
@@ -336,11 +342,7 @@ def analyze_variant(
             elif kind == "response.done":
                 status = (event.get("response") or {}).get("status")
                 response_terminals[response_id(event)] = status
-                if (
-                    trace_format is TraceFormat.TURN_BASED_PCM16
-                    and status == "cancelled"
-                    and playout is not None
-                ):
+                if stops_playout(event, cut_events) and playout is not None:
                     cut_playout(time_s)
                 else:
                     pass
@@ -350,12 +352,7 @@ def analyze_variant(
                 "sglang.input_audio.ended",
             ):
                 accepted_receipts.setdefault(kind, at(time_s))
-            elif trace_format is TraceFormat.LEGACY_PCM16 and (
-                kind == "output_audio_buffer.cleared"
-                or (
-                    kind == "input_audio_buffer.speech_started" and interrupts_on_speech
-                )
-            ):
+            elif stops_playout(event, cut_events):
                 if playout is None:
                     continue
                 else:

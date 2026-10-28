@@ -114,9 +114,9 @@ def export(
         else:
             pass
         # note (luojiaxuan): load_runs already required a profile of the format's
-        # protocol; the turn-based protocols take their rate from that profile.
-        profile_rate = (
-            PROFILES[read_json(run / "manifest.json")["profile"]].output_sample_rate
+        # protocol; the turn-based protocols take their rate and cuts from it.
+        profile = (
+            PROFILES[read_json(run / "manifest.json")["profile"]]
             if capture_format is not TraceFormat.PCM16
             else None
         )
@@ -125,8 +125,9 @@ def export(
             capture_format,
             None if state["input"] is None else state["input"]["sha256"],
             receipts_required=send_receipts_required(run),
-            profile_rate=profile_rate,
+            profile_rate=profile.output_sample_rate if profile is not None else None,
             tail_appends=tail_appends(read_json(run / "manifest.json")),
+            playout_cuts=profile.playout_cuts if profile is not None else frozenset(),
         )
         reasons = record["window"]["reasons"]
         # note (luojiaxuan): A legacy or turn-based session that failed its

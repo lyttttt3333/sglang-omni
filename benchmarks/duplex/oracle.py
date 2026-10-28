@@ -7,6 +7,7 @@ from collections import Counter
 
 from pydantic import JsonValue, ValidationError
 
+from benchmarks.duplex.openai_client import DIALECTS, echo_mismatches
 from benchmarks.duplex.oracle_models import (
     AdmissionEvent,
     Identifier,
@@ -132,7 +133,9 @@ def evaluate_trace(
     its manifest; None checks only that denials count up from one.
     """
     profile_contract = PROFILES[profile]
-    if profile_contract.protocol == "legacy":
+    if profile_contract.wire != "sglang":
+        return evaluate_openai_trace(records, profile_contract=profile_contract)
+    elif profile_contract.protocol == "legacy":
         return evaluate_legacy_trace(
             records,
             profile_contract=profile_contract,
@@ -1020,6 +1023,195 @@ def evaluate_legacy_trace(
             response_state.terminal is None
             for response_state in response_states.values()
         ),
+    }
+    return {
+        "status": "fail" if violations else "pass",
+        "violations": violations,
+        "coverage": coverage,
+        "metrics": metrics,
+    }
+
+
+def add_usage(total: dict[str, float], usage: JsonValue, prefix: str = "") -> None:
+    """Sum the numeric leaves of a usage object into total, keyed by dotted path."""
+    for key, value in usage.items() if isinstance(usage, dict) else ():
+        if isinstance(value, dict):
+            add_usage(total, value, f"{prefix}{key}.")
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            total[prefix + key] = total.get(prefix + key, 0) + value
+        else:
+            pass
+
+
+def evaluate_openai_trace(
+    records: list[dict[str, JsonValue]], *, profile_contract: DuplexProfile
+) -> dict[str, JsonValue]:
+    """Validate a session recorded over an OpenAI wire by what the client controls or
+    observes: the configuration acknowledged, the input sent in order, no error, and
+    the session ended by the client's end-of-input rule. The provider's event
+    vocabulary is not ours to police, so unknown server events pass."""
+    dialect = DIALECTS[profile_contract.wire]
+    violations: list[str] = []
+
+    def check(condition: bool, message: str) -> None:
+        if not condition:
+            violations.append(message)
+        else:
+            pass
+
+    server_events: Counter[str] = Counter()
+    # note (wenyao): Realtime can finish one response twice, completed and then
+    # cancelled at a barge-in, with the same usage; Live reports cumulative
+    # snapshots. The latest report per response, or per session, counts once.
+    usage_reports: dict[str, JsonValue] = {}
+    input_times: list[float] = []
+    audio_times: list[float] = []
+    input_byte_count = output_byte_count = next_sequence = admissions = 0
+    responses_created = 0
+    configured = acknowledged = close_sent = closed = False
+    requested_session: JsonValue = None
+    previous_time = -math.inf
+
+    for index, raw_record in enumerate(records):
+        try:
+            record = TraceRecord.model_validate(raw_record)
+            check(record.time_s >= previous_time, f"record {index}: clock regressed")
+            previous_time = record.time_s
+            event = record.event
+            event_type = event.get("type")
+            if record.direction == "admission":
+                admissions += 1
+            elif record.direction == "error":
+                violations.append(f"client error: {event.get('message')}")
+            elif record.direction == "send" and event_type == dialect.configure_type:
+                check(not configured, f"duplicate {event_type}")
+                configured = True
+                requested_session = event.get("session")
+            elif (
+                record.direction == "send" and event_type == "input_audio_buffer.append"
+            ):
+                check(
+                    acknowledged,
+                    "audio input before the configuration was acknowledged",
+                )
+                check(not close_sent, f"input after {dialect.close_type}")
+                metadata = event.get("sglang")
+                metadata = metadata if isinstance(metadata, dict) else {}
+                t_start_ms = metadata.get("t_start_ms")
+                check(
+                    metadata.get("seq") == next_sequence,
+                    "input sequence is not contiguous",
+                )
+                check(
+                    isinstance(t_start_ms, (int, float))
+                    and math.isclose(
+                        t_start_ms,
+                        input_byte_count / INPUT_BYTES_PER_MS,
+                        rel_tol=0,
+                        abs_tol=1e-7,
+                    ),
+                    "input media time is not sample-contiguous",
+                )
+                input_byte_count += len(pcm_bytes(event.get("audio")))
+                next_sequence += 1
+                input_times.append(record.time_s)
+            elif (
+                record.direction == "send"
+                and event_type == "conversation.item.truncate"
+                and profile_contract.protocol == "turn_based"
+            ):
+                check(
+                    isinstance(event.get("item_id"), str),
+                    "conversation.item.truncate without an item_id",
+                )
+            elif record.direction == "send" and event_type == dialect.close_type:
+                check(bool(input_times), f"{event_type} before audio input")
+                close_sent = True
+            elif record.direction == "send":
+                violations.append(f"client command outside this scenario: {event_type}")
+            else:
+                server_events[str(event_type)] += 1
+                if event_type == "error":
+                    error = event.get("error")
+                    error = error if isinstance(error, dict) else {}
+                    # note (wenyao): Realtime names the failing client event in
+                    # error.event_id, Live in error.client_event_id.
+                    client_event_id = error.get("event_id") or error.get(
+                        "client_event_id"
+                    )
+                    violations.append(
+                        f"server error: code={error.get('code')}: {error.get('message')}"
+                        + (
+                            f" (client event {client_event_id})"
+                            if client_event_id is not None
+                            else ""
+                        )
+                    )
+                elif event_type == dialect.acknowledgment:
+                    check(
+                        configured and not acknowledged,
+                        f"{event_type} without a pending {dialect.configure_type}",
+                    )
+                    acknowledged = True
+                    violations.extend(
+                        f"{event_type}: {mismatch}"
+                        for mismatch in echo_mismatches(
+                            dialect, requested_session, event.get("session")
+                        )
+                    )
+                elif event_type == "response.created":
+                    responses_created += 1
+                elif event_type == "response.done":
+                    response = event.get("response") or {}
+                    usage_reports[f"response {response.get('id')}"] = response.get(
+                        "usage"
+                    )
+                elif event_type == "response.output_audio.delta":
+                    output_byte_count += len(pcm_bytes(event.get("delta")))
+                    audio_times.append(record.time_s)
+                elif event_type in ("session.usage.updated", dialect.closed_type):
+                    usage_reports["session"] = event.get("usage")
+                    if event_type == dialect.closed_type:
+                        check(close_sent, f"{event_type} before {dialect.close_type}")
+                        closed = True
+                    else:
+                        pass
+                else:
+                    pass
+        except (ValidationError, ValueError, binascii.Error) as exc:
+            violations.append(f"record {index}: {exc}")
+
+    check(acknowledged, f"missing {dialect.acknowledgment}")
+    check(bool(input_times), "missing audio input")
+    check(
+        dialect.closed_type is None or closed,
+        f"missing {dialect.closed_type} after {dialect.close_type}",
+    )
+    coverage = {
+        "input_output_overlap": bool(audio_times)
+        and any(
+            audio_times[0] < event_time_s < audio_times[-1]
+            for event_time_s in input_times
+        )
+    }
+    usage: dict[str, float] = {}
+    for report in usage_reports.values():
+        add_usage(usage, report)
+    metrics = {
+        "input_audio_s": input_byte_count / INPUT_BYTES_PER_S,
+        "output_audio_s": output_byte_count / (profile_contract.output_sample_rate * 2),
+        "admission_denials": admissions,
+        "first_audio_packet_s": (
+            audio_times[0] - input_times[0] if audio_times and input_times else None
+        ),
+        "audio_packet_gap_max_s": max(
+            (right - left for left, right in zip(audio_times, audio_times[1:])),
+            default=None,
+        ),
+        "input_output_overlap": coverage["input_output_overlap"],
+        "responses_created": responses_created,
+        "server_events": dict(server_events),
+        "usage": usage,
     }
     return {
         "status": "fail" if violations else "pass",

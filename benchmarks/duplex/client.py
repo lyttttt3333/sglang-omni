@@ -8,6 +8,7 @@ import base64
 import json
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, TypedDict
 
@@ -15,7 +16,13 @@ import websockets
 from pydantic import BaseModel, ConfigDict, JsonValue
 
 from benchmarks.duplex.oracle_models import turn_detection_type
-from benchmarks.duplex.profiles import DEFAULT_PROFILE, PROFILES, ProfileName, Protocol
+from benchmarks.duplex.profiles import (
+    DEFAULT_PROFILE,
+    PROFILES,
+    PlayoutCut,
+    ProfileName,
+    Protocol,
+)
 
 SAMPLE_RATE = 16000
 PACKET_MS = 80
@@ -74,6 +81,18 @@ PLAYBACK_REPORT = (
     "receipt: each audio delta plays from the later of its arrival and the end of "
     "the previous delta, and the cut drops what is still unplayed"
 )
+OPENAI_REALTIME_PLAYBACK_REPORT = (
+    "conversation.item.truncate at most once per item, with audio_end_ms the part of "
+    "that item a zero-buffer player had played at the cut: at "
+    "input_audio_buffer.speech_started, unless turn_detection.interrupt_response is "
+    "false, for each reply with audio still unplayed, and at a response.done with "
+    "status cancelled for that reply; each audio delta plays from the later of its "
+    "arrival and the end of the previous delta, and a cut drops what is still unplayed"
+)
+PLAYBACK_REPORTS: dict[frozenset[PlayoutCut], str] = {
+    PROFILES["turn-based"].playout_cuts: PLAYBACK_REPORT,
+    PROFILES["openai-realtime"].playout_cuts: OPENAI_REALTIME_PLAYBACK_REPORT,
+}
 
 
 class TurnDetection(BaseModel):
@@ -95,6 +114,89 @@ def profile_protocol(
         )
     else:
         return protocol
+
+
+def session_cuts(
+    cuts: frozenset[PlayoutCut], turn_detection: JsonValue
+) -> frozenset[PlayoutCut]:
+    """A profile's playout cuts in a session configured with this turn_detection
+    object; speech_started cuts only when the server interrupts a reply on speech."""
+    settings = turn_detection if isinstance(turn_detection, dict) else {}
+    if settings.get("interrupt_response") is False:
+        return cuts - {"input_audio_buffer.speech_started"}
+    else:
+        return cuts
+
+
+def stops_playout(event: dict[str, JsonValue], cuts: frozenset[PlayoutCut]) -> bool:
+    event_type = event.get("type")
+    return event_type in cuts and (
+        event_type != "response.done"
+        or (event.get("response") or {}).get("status") == "cancelled"
+    )
+
+
+@dataclass
+class ZeroBufferPlayer:
+    """The player PLAYBACK_REPORTS describe: when its cursor frees, each reply's
+    (start, seconds) deltas, and the items already truncated."""
+
+    output_rate: int
+    cuts: frozenset[PlayoutCut]
+    cursor_s: float = 0.0
+    reply_audio: dict[str, list[tuple[float, float]]] = field(default_factory=dict)
+    reply_items: dict[str, str] = field(default_factory=dict)
+    truncated_items: set[str] = field(default_factory=set)
+
+    def played(
+        self, event: dict[str, JsonValue], now_s: float
+    ) -> list[dict[str, JsonValue]]:
+        """Play an audio delta, or stop at a playout cut and return the
+        conversation.item.truncate fields of each reply it cuts: the reply a cancelled
+        response.done names, or at any other cut every reply with audio unplayed."""
+        event_type = event["type"]
+        if event_type == "response.output_audio.delta":
+            seconds = len(base64.b64decode(event["delta"])) / 2 / self.output_rate
+            start_s = max(self.cursor_s, now_s)
+            self.cursor_s = start_s + seconds
+            self.reply_audio.setdefault(event["response_id"], []).append(
+                (start_s, seconds)
+            )
+            self.reply_items[event["response_id"]] = event["item_id"]
+            return []
+        elif stops_playout(event, self.cuts):
+            self.cursor_s = min(self.cursor_s, now_s)
+            cut_replies = (
+                [event["response"]["id"]]
+                if event_type == "response.done"
+                else [
+                    response_id
+                    for response_id, deltas in self.reply_audio.items()
+                    if any(start_s + seconds > now_s for start_s, seconds in deltas)
+                ]
+            )
+            truncates: list[dict[str, JsonValue]] = []
+            for response_id in cut_replies:
+                item_id = self.reply_items.get(response_id)
+                if item_id is None or item_id in self.truncated_items:
+                    continue
+                else:
+                    pass
+                self.truncated_items.add(item_id)
+                played_s = sum(
+                    min(seconds, max(0.0, now_s - start_s))
+                    for start_s, seconds in self.reply_audio[response_id]
+                )
+                truncates.append(
+                    {
+                        "item_id": item_id,
+                        "content_index": 0,
+                        "audio_end_ms": int(played_s * 1000),
+                    }
+                )
+            return truncates
+        else:
+            return []
 
 
 class InputAudioMetadata(TypedDict):
@@ -126,11 +228,28 @@ async def run_session(
 
     turn_detection configures a legacy-protocol or turn-based session; tail_s is the
     delay after the input end before a legacy-protocol session's liveness probe;
-    report_playback makes a turn-based session report each cancelled reply's played
-    audio as PLAYBACK_REPORT describes; tail_silence_s and end_wait_s set the
+    report_playback makes a turn-based session report each cut reply's played
+    audio as PLAYBACK_REPORTS describes; tail_silence_s and end_wait_s set the
     end of input as END_OF_INPUT_RULE describes (end_wait_s None: only the session
     timeout bounds the drain).
     """
+    if PROFILES[profile].wire != "sglang":
+        # note (wenyao): openai_client builds on this module, so it loads on dispatch.
+        from benchmarks.duplex.openai_client import run_openai_session
+
+        return await run_openai_session(
+            url,
+            pcm,
+            trace_path=trace_path,
+            timeout_s=timeout_s,
+            profile=profile,
+            turn_detection=turn_detection,
+            report_playback=report_playback,
+            tail_silence_s=tail_silence_s,
+            end_wait_s=end_wait_s,
+        )
+    else:
+        pass
     if not pcm or len(pcm) % 2:
         raise ValueError("Input must be nonempty PCM16")
     else:
@@ -285,46 +404,17 @@ async def run_session(
                         await asyncio.gather(*waiters, return_exceptions=True)
                     return receipt.is_set()
 
-                # note (luojiaxuan): the zero-buffer player of report_playback: when
-                # its cursor frees, and each reply's (start, seconds) deltas.
-                playout_cursor_s = 0.0
-                reply_audio: dict[str, list[tuple[float, float]]] = {}
-                reply_items: dict[str, str] = {}
-
-                async def report_played(event: dict[str, JsonValue], now_s: float) -> None:
-                    nonlocal playout_cursor_s
-                    event_type = event["type"]
-                    if event_type == "response.output_audio.delta":
-                        seconds = len(base64.b64decode(event["delta"])) / 2 / output_rate
-                        start_s = max(playout_cursor_s, now_s)
-                        playout_cursor_s = start_s + seconds
-                        reply_audio.setdefault(event["response_id"], []).append(
-                            (start_s, seconds)
-                        )
-                        reply_items[event["response_id"]] = event["item_id"]
-                    elif (
-                        event_type == "response.done"
-                        and event["response"]["status"] == "cancelled"
-                    ):
-                        response_id = event["response"]["id"]
-                        playout_cursor_s = min(playout_cursor_s, now_s)
-                        if response_id in reply_items:
-                            played_s = sum(
-                                min(seconds, max(0.0, now_s - start_s))
-                                for start_s, seconds in reply_audio[response_id]
-                            )
-                            await send(
-                                "conversation.item.truncate",
-                                truncate={
-                                    "item_id": reply_items[response_id],
-                                    "content_index": 0,
-                                    "audio_end_ms": int(played_s * 1000),
-                                },
-                            )
-                        else:
-                            pass
-                    else:
-                        pass
+                player = ZeroBufferPlayer(
+                    output_rate,
+                    session_cuts(
+                        PROFILES[profile].playout_cuts,
+                        (
+                            turn_detection.model_dump(mode="json")
+                            if turn_detection is not None
+                            else None
+                        ),
+                    ),
+                )
 
                 async def receive() -> None:
                     nonlocal fatal
@@ -349,10 +439,10 @@ async def run_session(
                             ) from exc
                         latest[event_type] = event
                         seen.setdefault(event_type, asyncio.Event()).set()
-                        if report_playback:
-                            await report_played(event, received_s)
-                        else:
-                            pass
+                        for truncate in (
+                            player.played(event, received_s) if report_playback else []
+                        ):
+                            await send("conversation.item.truncate", truncate=truncate)
                         if event_type == "error":
                             # note (wenyao): Close waits for adapter teardown.
                             extension = event.get("sglang")

@@ -16,8 +16,14 @@ import soundfile
 from pydantic import JsonValue
 from scipy.signal import resample_poly
 
-from benchmarks.duplex.client import PACKET_MS, SAMPLE_RATE
-from benchmarks.duplex.profiles import DEFAULT_PROFILE, PROFILES, ProfileName, Protocol
+from benchmarks.duplex.client import PACKET_MS, SAMPLE_RATE, session_cuts, stops_playout
+from benchmarks.duplex.oracle_models import session_turn_detection
+from benchmarks.duplex.profiles import (
+    DEFAULT_PROFILE,
+    PROFILES,
+    PlayoutCut,
+    ProfileName,
+)
 
 PLAYOUT_CAVEATS = [
     "physical_acoustics",
@@ -45,9 +51,15 @@ TURN_BASED_BARGE_IN_CUT = (
     "playout cursor cut at the client receipt of a response.done with status "
     "cancelled"
 )
-BARGE_IN_CUTS: dict[Protocol, str] = {
-    "legacy": LEGACY_BARGE_IN_CUT,
-    "turn_based": TURN_BASED_BARGE_IN_CUT,
+OPENAI_REALTIME_BARGE_IN_CUT = (
+    "playout cursor cut at the client receipt of input_audio_buffer.speech_started "
+    "when turn_detection.interrupt_response is not false, or of a response.done with "
+    "status cancelled"
+)
+BARGE_IN_CUTS: dict[frozenset[PlayoutCut], str] = {
+    PROFILES["qwen3-omni-half-duplex"].playout_cuts: LEGACY_BARGE_IN_CUT,
+    PROFILES["turn-based"].playout_cuts: TURN_BASED_BARGE_IN_CUT,
+    PROFILES["openai-realtime"].playout_cuts: OPENAI_REALTIME_BARGE_IN_CUT,
 }
 # note (wenyao): Playout and event spans assume paced source time within one packet.
 PACING_TOLERANCE_S = PACKET_MS / 1000
@@ -154,6 +166,23 @@ def reconstruct_output(
         errors.append("no input_audio_buffer.append was sent")
     else:
         pass
+    configure = next(
+        (
+            record["event"]
+            for _, record in records
+            if record["direction"] == "send"
+            and record["event"].get("type") == "session.update"
+        ),
+        None,
+    )
+    cut_events = session_cuts(
+        profile_contract.playout_cuts,
+        (
+            session_turn_detection(configure.get("session"), protocol)
+            if configure is not None
+            else None
+        ),
+    )
     media = bytearray()
     playout = bytearray()
     chunks = []
@@ -161,7 +190,6 @@ def reconstruct_output(
     transcript_events = []
     appends = []
     input_end_s = 0.0
-    interrupts_on_speech = None
 
     def cut_playout(line_number: int, event_type: str, elapsed_s: float) -> None:
         cut_sample = round(elapsed_s * output_sample_rate)
@@ -210,29 +238,9 @@ def reconstruct_output(
                 ) / (2 * SAMPLE_RATE)
             else:
                 pass
-        elif (
-            legacy
-            and record["direction"] == "send"
-            and event_type == "session.update"
-            and interrupts_on_speech is None
-        ):
-            turn_detection = event["session"].get("turn_detection") or {}
-            interrupts_on_speech = turn_detection.get("interrupt_response") is not False
         elif record["direction"] != "receive":
             continue
-        elif legacy and (
-            event_type == "output_audio_buffer.cleared"
-            or (
-                event_type == "input_audio_buffer.speech_started"
-                and interrupts_on_speech
-            )
-        ):
-            cut_playout(line_number, event_type, elapsed_s)
-        elif (
-            protocol == "turn_based"
-            and event_type == "response.done"
-            and (event.get("response") or {}).get("status") == "cancelled"
-        ):
+        elif stops_playout(event, cut_events):
             cut_playout(line_number, event_type, elapsed_s)
         elif event_type in transcript_deltas:
             transcript_events.append(
@@ -362,8 +370,11 @@ def reconstruct_output(
         "input_timing": input_timing,
         "errors": errors,
     }
-    if protocol in BARGE_IN_CUTS:
-        summary["barge_in"] = {"rule": BARGE_IN_CUTS[protocol], "cuts": len(cuts)}
+    if profile_contract.playout_cuts:
+        summary["barge_in"] = {
+            "rule": BARGE_IN_CUTS[profile_contract.playout_cuts],
+            "cuts": len(cuts),
+        }
     else:
         pass
     write_json(
@@ -372,7 +383,7 @@ def reconstruct_output(
             **summary,
             "input_timing": {**input_timing, "appends": appends},
             "chunks": chunks,
-            **({"cuts": cuts} if protocol in BARGE_IN_CUTS else {}),
+            **({"cuts": cuts} if profile_contract.playout_cuts else {}),
         },
     )
     return summary
