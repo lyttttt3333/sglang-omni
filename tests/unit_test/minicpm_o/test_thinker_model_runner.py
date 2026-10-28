@@ -495,6 +495,30 @@ def test_after_a_stop_only_the_users_voice_frees_the_model(
     ] == [True, is_listen_held, is_listen_held]
 
 
+@pytest.mark.parametrize(
+    ("units_after_the_stop", "is_interrupted"),
+    [(0, True), (1, False)],
+    ids=["no_unit_carried_the_stop", "a_unit_carried_the_stop"],
+)
+def test_the_input_end_reports_a_stop_no_unit_has_carried(
+    units_after_the_stop: int, is_interrupted: bool
+) -> None:
+    """A stop just before the input ends reaches the talker only through the input end's result, which must report it so the talker drops the speech a turn the model ended still owes; a stop a unit already carried is not reported again."""
+    adapter, request = open_duplex_adapter()
+
+    listen_after_a_stop(adapter, request, [SILENT_UNIT_PCM] * units_after_the_stop)
+    input_end = adapter.finish_input(SESSION, step_plan_payload(request))
+
+    assert input_end.data == dict(
+        talker_conditions=[],
+        text="",
+        is_listen=True,
+        end_of_turn=True,
+        is_interrupted=is_interrupted,
+        hears_user=False,
+    )
+
+
 def speak_two_units(
     adapter: ThinkerAdapter,
     request: OmniRequest,

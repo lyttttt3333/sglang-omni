@@ -30,19 +30,22 @@ class Unit(NamedTuple):
 
 
 class Spoken(NamedTuple):
-    """What the talker did with a unit: whether it spoke, how many units of speech its request could hold, and what it reported downstream."""
+    """What the talker did with a unit: whether it spoke, how many units of speech its request could hold, and what it reported downstream; whether it reset its history, and how early its request could stop at a codec EOS."""
 
     speaks: bool
     speech_units: int
     end_of_turn: bool
     is_speech_cut: bool
     ends_previous_turn: bool = False
+    reset_history: bool = False
+    masks_chunk_boundary_eos: bool = False
+    min_new_tokens: int = 0
 
 
 FULL = CODEC_CHUNK_SIZE
 REPLY = Unit(True, FULL)
 OWING_TURN_END = Unit(True, FULL, is_model_turn_end=True)
-SILENT = Spoken(False, 0, False, False)
+SILENT_RESET = Spoken(False, 0, False, False, reset_history=True)
 
 
 def talker_model() -> SimpleNamespace:
@@ -83,11 +86,18 @@ def run_talker(units: list[Unit]) -> list[Spoken]:
             ),
         )
         chunk = TimedChunk("text", 0, 1000, 0, None, eos=unit.is_input_end)
-        if adapter.prepare_unit(IDENTITY, chunk, payload).bypass_generation:
+        preparation = adapter.prepare_unit(IDENTITY, chunk, payload)
+        if preparation.bypass_generation:
             speech_units = 0
+            masks_chunk_boundary_eos = False
+            min_new_tokens = 0
         else:
             request_data = adapter.build(IDENTITY, chunk, payload)
             speech_units = request_data.max_new_tokens // CODEC_CHUNK_SIZE
+            masks_chunk_boundary_eos = request_data.talker_model_inputs[
+                "masks_chunk_boundary_eos"
+            ]
+            min_new_tokens = request_data.req.sampling_params.min_new_tokens
             request_data.output_ids = list(range(unit.committed_tokens))
             adapter.result(IDENTITY, request_data)
         spoken.append(
@@ -97,6 +107,9 @@ def run_talker(units: list[Unit]) -> list[Spoken]:
                 payload.data["end_of_turn"],
                 payload.data["is_speech_cut"],
                 payload.data["ends_previous_turn"],
+                preparation.reset_history,
+                masks_chunk_boundary_eos,
+                min_new_tokens,
             )
         )
     return spoken
@@ -112,7 +125,7 @@ def run_talker(units: list[Unit]) -> list[Spoken]:
                 Spoken(True, 1, False, False),
                 Spoken(True, 1, False, False),
                 Spoken(True, 1, True, False),
-                SILENT,
+                SILENT_RESET,
             ],
         ),
         (
@@ -130,7 +143,7 @@ def run_talker(units: list[Unit]) -> list[Spoken]:
                 Spoken(True, 1, False, False),
                 Spoken(True, 1, False, False),
                 Spoken(True, 1, True, True),
-                SILENT,
+                SILENT_RESET,
             ],
         ),
         (
@@ -139,7 +152,7 @@ def run_talker(units: list[Unit]) -> list[Spoken]:
                 Spoken(True, 1, False, False),
                 Spoken(True, 1, False, False),
                 Spoken(False, 0, True, True),
-                SILENT,
+                SILENT_RESET,
             ],
         ),
         (
@@ -151,11 +164,29 @@ def run_talker(units: list[Unit]) -> list[Spoken]:
             ],
         ),
         (
+            [
+                REPLY,
+                OWING_TURN_END,
+                Unit(False, is_input_end=True, is_interrupted=True),
+            ],
+            [
+                Spoken(True, 1, False, False),
+                Spoken(True, 1, False, False),
+                Spoken(False, 0, True, True),
+            ],
+        ),
+        (
+            [REPLY, Unit(False, is_interrupted=True)],
+            [Spoken(True, 1, False, False), Spoken(False, 0, True, True)],
+        ),
+        (
             [REPLY, OWING_TURN_END, Unit(True, FULL)],
             [
                 Spoken(True, 1, False, False),
                 Spoken(True, 1, False, False),
-                Spoken(True, 1, False, False, ends_previous_turn=True),
+                Spoken(
+                    True, 1, False, False, ends_previous_turn=True, reset_history=True
+                ),
             ],
         ),
         (
@@ -168,13 +199,23 @@ def run_talker(units: list[Unit]) -> list[Spoken]:
             [
                 Spoken(True, 1, False, False),
                 Spoken(True, 1, True, False),
-                SILENT,
+                SILENT_RESET,
                 Spoken(False, 0, True, False),
             ],
         ),
         (
             [REPLY, Unit(False, 60, is_input_end=True)],
-            [Spoken(True, 1, False, False), Spoken(True, 4, True, False)],
+            [
+                Spoken(True, 1, False, False),
+                Spoken(True, 4, True, False, masks_chunk_boundary_eos=True),
+            ],
+        ),
+        (
+            [REPLY, Unit(False, 4 * FULL + 1, is_input_end=True)],
+            [
+                Spoken(True, 1, False, False),
+                Spoken(True, 4, True, True, masks_chunk_boundary_eos=True),
+            ],
         ),
         (
             [
@@ -187,7 +228,7 @@ def run_talker(units: list[Unit]) -> list[Spoken]:
                 Spoken(True, 1, False, False),
                 Spoken(True, 1, False, False),
                 Spoken(True, 1, False, False),
-                Spoken(True, 2, True, True),
+                Spoken(True, 2, True, True, masks_chunk_boundary_eos=True),
             ],
         ),
     ],
@@ -196,9 +237,12 @@ def run_talker(units: list[Unit]) -> list[Spoken]:
         "owed-text-past-the-drain-budget-ends-incomplete",
         "the-users-voice-stops-the-owed-speech",
         "a-client-stop-stops-the-owed-speech",
+        "a-stop-at-the-input-end-stops-the-owed-speech",
+        "a-client-stop-mid-reply-speaks-nothing-more",
         "a-new-reply-ends-the-owed-speech-first",
         "a-turn-spoken-to-the-codec-eos-owes-nothing",
         "input-end-mid-reply-speaks-what-is-owed-in-one-request",
+        "a-codec-token-in-the-windows-extra-slot-still-owes-speech",
         "input-end-while-owing-speaks-the-rest-of-the-budget",
     ],
 )
