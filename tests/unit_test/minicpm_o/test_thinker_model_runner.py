@@ -437,8 +437,20 @@ def test_a_stop_holds_the_listen_through_silence_until_the_user_speaks(
         *[[SPECIAL_TOKENS.unit_end, PLAIN_TOKEN_ID]] * 3,
     ]
     assert [result.data for _, result in finished_units] == [
-        dict(talker_conditions=[], text="", is_listen=True, end_of_turn=end_of_turn)
-        for end_of_turn in (True, False, False, False)
+        dict(
+            talker_conditions=[],
+            text="",
+            is_listen=True,
+            end_of_turn=end_of_turn,
+            is_interrupted=end_of_turn,
+            hears_user=hears_user,
+        )
+        for end_of_turn, hears_user in (
+            (True, False),
+            (False, False),
+            (False, True),
+            (False, False),
+        )
     ]
     assert state.is_turn_ended is True
 
@@ -518,6 +530,35 @@ def speak_two_units(
         output_ids=second_output_ids,
         generated_unit_ids=second_generated_ids,
     )
+
+
+@pytest.mark.parametrize(
+    ("second_unit_ends_turn", "hears_user"),
+    [(True, [False, True]), (False, [False, False])],
+    ids=["after_the_model_ended_its_turn", "mid_reply"],
+)
+def test_units_after_the_model_ends_its_turn_report_the_users_voice(
+    second_unit_ends_turn: bool, hears_user: list[bool]
+) -> None:
+    """The talker goes on speaking a turn the model ended only while no one speaks, so the units after that turn end report the user's voice; units of an open reply run no detector."""
+    adapter, request = open_duplex_adapter()
+    speak_two_units(
+        adapter,
+        request,
+        first_unit_ends_turn=False,
+        second_unit_ends_turn=second_unit_ends_turn,
+    )
+    results = []
+    for input_seq, payload in enumerate(
+        [SILENT_UNIT_PCM, unit_pcm(speech(UNIT_SAMPLES), VOICE_DBFS)], start=2
+    ):
+        unit_request = adapter.build(
+            SESSION, audio_unit(input_seq, payload), step_plan_payload(request)
+        )
+        unit_request.output_ids = [SPECIAL_TOKENS.listen]
+        results.append(adapter.result(SESSION, unit_request).data["hears_user"])
+
+    assert results == hears_user
 
 
 @pytest.mark.parametrize(
