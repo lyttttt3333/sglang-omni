@@ -27,31 +27,27 @@ def unit_batch(**overrides) -> Mock:
     return Mock(**fields)
 
 
-class RecordingRunner(ModelRunner):
-    def __init__(self) -> None:
-        self.modes_seen: list[ForwardMode] = []
-
+class FakeBuildRunner(ModelRunner):
     def build_forward_batch(self, scheduler_output):
         batch = scheduler_output.batch_data
-        self.modes_seen.append(batch.forward_mode)
-        return Mock(name="forward_batch"), batch, batch.forward_mode.is_extend()
+        forward_batch = Mock(forward_mode=batch.forward_mode)
+        return forward_batch, batch, batch.forward_mode.is_extend()
 
 
-class PromotingRunner(UnitDecodeRunner, RecordingRunner):
+class PromotingRunner(UnitDecodeRunner, FakeBuildRunner):
     pass
 
 
 def test_promotion_builds_a_decode_forward_and_retires_an_extend() -> None:
-    runner = PromotingRunner()
+    runner = object.__new__(PromotingRunner)
     batch = unit_batch()
     forward_batch, schedule_batch, is_prefill = runner.build_forward_batch(
         Mock(batch_data=batch)
     )
-    assert runner.modes_seen == [ForwardMode.DECODE]
+    assert forward_batch.forward_mode == ForwardMode.DECODE
     assert schedule_batch is batch
     assert batch.forward_mode == ForwardMode.EXTEND
     assert not is_prefill
-    assert forward_batch is not None
 
 
 @pytest.mark.parametrize(
@@ -65,11 +61,11 @@ def test_promotion_builds_a_decode_forward_and_retires_an_extend() -> None:
     ],
 )
 def test_other_extends_are_built_unchanged(overrides: dict) -> None:
-    runner = PromotingRunner()
-    _, _, is_prefill = runner.build_forward_batch(
+    runner = object.__new__(PromotingRunner)
+    forward_batch, _, is_prefill = runner.build_forward_batch(
         Mock(batch_data=unit_batch(**overrides))
     )
-    assert runner.modes_seen == [ForwardMode.EXTEND]
+    assert forward_batch.forward_mode == ForwardMode.EXTEND
     assert is_prefill
 
 
