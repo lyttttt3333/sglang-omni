@@ -48,7 +48,7 @@ def warmup_kda_prefill(
     else:
         pass
     start_seconds = time.monotonic()
-    # note (Codex): Decode warmup misses the kernels above KDA's fused-grid cutoff.
+    # note (Zhuofeng Li): Decode warmup misses the kernels above KDA's fused-grid cutoff.
     for sequence_count in (1, KDA_FUSED_GRID_BLOCK_LIMIT // head_count + 1):
         token_count = sequence_count * KDA_CHUNK_TOKEN_COUNT
         query = torch.zeros(

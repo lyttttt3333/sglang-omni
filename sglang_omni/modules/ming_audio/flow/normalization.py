@@ -93,7 +93,7 @@ if HAS_TRITON:
         second_sum = tl.full((reduction_lane_count,), 0, tl.float32)
         third_sum = tl.full((reduction_lane_count,), 0, tl.float32)
         fourth_sum = tl.full((reduction_lane_count,), 0, tl.float32)
-        # note (Codex): Preserve the native four-accumulator FP32 mean and descending warp tree.
+        # note (Zhuofeng Li): Preserve the native four-accumulator FP32 mean and descending warp tree.
         for group_index in tl.static_range(
             channel_count // (vector_width * reduction_lane_count)
         ):
@@ -188,7 +188,7 @@ if HAS_TRITON:
         second_sum = tl.full((reduction_lane_count, row_tile_size), 0, tl.float32)
         third_sum = tl.full((reduction_lane_count, row_tile_size), 0, tl.float32)
         fourth_sum = tl.full((reduction_lane_count, row_tile_size), 0, tl.float32)
-        # note (Codex): Native strided means vectorize rows and reduce channels in four sequential accumulators.
+        # note (Zhuofeng Li): Native strided means vectorize rows and reduce channels in four sequential accumulators.
         for group_index in tl.static_range(
             tl.cdiv(channel_count, vector_width * reduction_lane_count)
         ):
@@ -223,7 +223,7 @@ if HAS_TRITON:
             third_sum = third_sum + third_value * third_value
             fourth_sum = fourth_sum + fourth_value * fourth_value
         partial_sums = ((first_sum + second_sum) + third_sum) + fourth_sum
-        # note (Codex): Spell out every descending level because a tiled tl.sum can choose a different FP32 tree.
+        # note (Zhuofeng Li): Spell out every descending level because a tiled tl.sum can choose a different FP32 tree.
         for shift in tl.static_range(
             0, tl.constexpr(reduction_lane_count.bit_length() - 1)
         ):

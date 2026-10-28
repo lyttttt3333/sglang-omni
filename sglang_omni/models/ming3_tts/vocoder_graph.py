@@ -66,7 +66,7 @@ class VocoderGraphRunner:
         stream = torch.cuda.Stream(device=self.vae.device)
         normalization_layers: list[Qwen2RMSNorm] = []
         try:
-            # note (Codex): The fused reduction follows the native CUDA tree in this PyTorch version.
+            # note (Zhuofeng Li): The fused reduction follows the native CUDA tree in this PyTorch version.
             if (
                 HAS_TRITON
                 and torch.__version__.split("+")[0] == "2.14.1"
