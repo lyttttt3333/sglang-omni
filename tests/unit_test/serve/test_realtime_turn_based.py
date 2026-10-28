@@ -4,10 +4,20 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import threading
 from dataclasses import replace
 
+import numpy as np
 import pytest
 
+from sglang_omni.audio.vad import VADConfig
+from sglang_omni.models.vad.session import SileroSpeechDetector, VADHooks
+from sglang_omni.proto.request import OmniRequest, StagePayload
+from sglang_omni.proto.session import SessionIdentity, TimedChunk
+from sglang_omni.proto.streams import AUDIO, PCM16, SPEECH_STARTED, SPEECH_STOPPED
+from sglang_omni.scheduling.session import SessionContext
+from sglang_omni.serve.realtime.control import UnitCompleted
 from sglang_omni.serve.realtime.negotiation import SessionNegotiation
 from sglang_omni.serve.realtime.output import (
     InputTranscription,
@@ -256,4 +266,109 @@ async def test_an_adapter_without_cancel_reports_not_supported():
         await runtime.cancel()
     with pytest.raises(ProtocolError, match="not truncate"):
         await runtime.truncate("item_0", 10.0)
+    await runtime.close("client_closed")
+
+
+class LoudFrameDetector(SileroSpeechDetector):
+    """The VAD stage's detector with any non-silent frame as speech, in place of Silero's probability."""
+
+    def infer(self, frame: np.ndarray) -> float:
+        return float(np.abs(frame).max() > 0)
+
+
+class VADAdapter(PlainAdapter):
+    """Runs each processed span through the VAD stage and keeps the boundaries it emits."""
+
+    def __init__(self) -> None:
+        self.hooks = VADHooks(VADConfig(silence_duration_ms=800), LoudFrameDetector)
+        self.identity = SessionIdentity("vad")
+        self.boundaries: list[TimedChunk] = []
+        self.context = SessionContext(
+            session_identity=self.identity,
+            cancelled=threading.Event(),
+            emit=self.boundaries.append,
+        )
+
+    async def open(
+        self, session_id: str, config: SessionConfiguration, emit: OutputSink
+    ) -> None:
+        self.hooks.open(self.identity, OmniRequest(None))
+
+    async def process(self, unit: Unit) -> int:
+        self.hooks.append(
+            TimedChunk(
+                AUDIO,
+                unit.start_sample * 1000 / 16000,
+                unit.real_samples * 1000 / 16000,
+                unit.index,
+                unit.pcm[: unit.real_samples * 2],
+                format=PCM16,
+            ),
+            StagePayload("vad", OmniRequest(None), None),
+            self.context,
+        )
+        return unit.real_samples
+
+
+@pytest.mark.asyncio
+async def test_server_vad_ends_the_turn_at_the_client_packet_that_completes_the_silence():
+    """Audio reaches the session as each 80 ms packet arrives, while receipts stay one per 200 ms unit."""
+    packet_ms, speech_ms, silence_ms = 80, 1024, 800
+    pcm = b"\x10\x27" * (16 * speech_ms) + b"\0" * (2 * 16 * 1376)
+    adapter = VADAdapter()
+    runtime = SessionRuntime("m", TURN_BASED, lambda: adapter, RuntimeLimits())
+    await runtime.update({"instructions": "Be brief."}, "e0")
+    stopped_after_packet = None
+    for packet_index, offset in enumerate(range(0, len(pcm), 2 * 16 * packet_ms)):
+        await runtime.append(
+            pcm[offset : offset + 2 * 16 * packet_ms],
+            packet_index,
+            float(packet_index * packet_ms),
+            f"e{packet_index + 1}",
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+        if stopped_after_packet is None and any(
+            chunk.payload["type"] == SPEECH_STOPPED for chunk in adapter.boundaries
+        ):
+            stopped_after_packet = packet_index
+        else:
+            pass
+    assert [(c.payload["type"], c.t_start_ms) for c in adapter.boundaries] == [
+        (SPEECH_STARTED, 0.0),
+        (SPEECH_STOPPED, float(speech_ms)),
+    ]
+    assert stopped_after_packet == math.ceil((speech_ms + silence_ms) / packet_ms) - 1
+    receipts = []
+    while (envelope := runtime.output_buffer.dequeue()) is not None:
+        if isinstance(envelope.event, UnitCompleted):
+            unit = envelope.unit
+            receipts.append((unit.unit_id, unit.start_sample, unit.real_samples))
+        else:
+            pass
+    assert receipts == [(f"unit_{i}", 3200 * i, 3200) for i in range(12)]
+    await runtime.close("client_closed")
+
+
+@pytest.mark.asyncio
+async def test_a_clear_ends_the_unit_whose_audio_already_reached_the_session():
+    adapter = CommittingAdapter()
+    runtime = SessionRuntime("m", TURN_BASED, lambda: adapter, RuntimeLimits())
+    await runtime.update({"instructions": "Be brief."}, "e0")
+    await runtime.append(b"\1\0" * 1280, 0, 0.0, "e1")
+    for _ in range(10):
+        await asyncio.sleep(0)
+    await runtime.clear("e2")
+    await runtime.append(b"\1\0" * 3200, 1, 80.0, "e3")
+    for _ in range(10):
+        await asyncio.sleep(0)
+    receipts = []
+    while (envelope := runtime.output_buffer.dequeue()) is not None:
+        if isinstance(envelope.event, UnitCompleted):
+            unit = envelope.unit
+            receipts.append((unit.unit_id, unit.start_sample, unit.real_samples))
+        else:
+            pass
+    assert adapter.events == [("unit", 1280), ("unit", 3200)]
+    assert receipts == [("unit_0", 0, 1280), ("unit_1", 1280, 3200)]
     await runtime.close("client_closed")
