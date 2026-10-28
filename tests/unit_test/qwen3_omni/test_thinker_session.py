@@ -40,7 +40,7 @@ PROMPT_TEXT = "<|im_start|>system\nbe brief<|im_end|>\n<|im_start|>user\n<audio>
 
 
 def spoken_ms(tokens: int) -> float:
-    """A playback time by which the talker has spoken `tokens` reply tokens at its median pace."""
+    """A playback time by which the talker has spoken that many reply tokens at its median pace."""
     return (tokens + 0.5) * CODEC_FRAME_MS * SPOKEN_FRAMES_PER_TOKEN
 
 

@@ -84,7 +84,7 @@ class ThinkerHistory:
 
 
 def heard_tokens(audio_end_ms: float) -> int:
-    """The reply tokens spoken in the first `audio_end_ms` of its audio, at the talker's median pace."""
+    """The reply tokens spoken in the first audio_end_ms of its audio, at the talker's median pace."""
     return int(audio_end_ms / CODEC_FRAME_MS / SPOKEN_FRAMES_PER_TOKEN)
 
 
