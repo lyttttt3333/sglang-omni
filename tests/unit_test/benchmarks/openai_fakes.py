@@ -798,8 +798,8 @@ class RealtimeFake(StrictFake):
 class LiveFake(StrictFake):
     """Full duplex: replies after quiet_s of input silence and yields yield_s after the
     caller speaks over it; output_speed is reply audio seconds per wall second.
-    Between replies it streams one quiet frame per CHUNK_S of wall time, as the real
-    API does."""
+    From the first input append it streams one quiet frame per CHUNK_S of wall time
+    between replies, as the real API does."""
 
     path: str = LIVE_PATH
     reply_s: float = 1.0
@@ -953,7 +953,6 @@ class LiveFake(StrictFake):
                             client_event_id=raw.get("event_id"),
                             session=snapshot,
                         )
-                        quiet_task = asyncio.create_task(stream_quiet())
                 elif snapshot is None or vad is None:
                     await reject(
                         "session_not_started", "send session.start first", None, raw
@@ -969,6 +968,10 @@ class LiveFake(StrictFake):
                         )
                         continue
                     connection.input_pcm.extend(pcm)
+                    if quiet_task is None:
+                        quiet_task = asyncio.create_task(stream_quiet())
+                    else:
+                        pass
                     for transition, media_ms in vad.feed(pcm):
                         if transition == "started":
                             if reply_task is not None and not reply_task.done():

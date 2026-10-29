@@ -468,9 +468,9 @@ def test_live_session_fails_when_the_start_is_not_echoed(
     records = live(LivePeer(echo), tmp_path)
 
     (error,) = [record for record in records if record["direction"] == "error"]
-    assert error["event"]["message"] == f"RuntimeError: session.started: {mismatch}"
+    assert error["event"]["message"] == f"RuntimeError: session.updated: {mismatch}"
     assert sent(records, "input_audio_buffer.append") == []
-    assert f"session.started: {mismatch}" in (
+    assert f"session.updated: {mismatch}" in (
         evaluate_trace(records, profile="openai-live")["violations"]
     )
 

@@ -16,7 +16,7 @@ import soundfile
 from pydantic import JsonValue
 from scipy.signal import resample_poly
 
-from benchmarks.duplex import serving
+from benchmarks.duplex import serving, v10_dataset
 from benchmarks.duplex.client import (
     OPENAI_REALTIME_PLAYBACK_REPORT,
     TurnDetection,
@@ -24,6 +24,9 @@ from benchmarks.duplex.client import (
 )
 from benchmarks.duplex.openai_client import LIVE_QUIET_S, LIVE_SPEECH_RMS, pcm_rms
 from benchmarks.duplex.oracle import evaluate_trace
+from benchmarks.duplex.reference_capture import TraceFormat
+from benchmarks.duplex.reference_export import export_runs
+from benchmarks.duplex.reference_v10 import export as export_v10
 from benchmarks.duplex.v15_audio import OPENAI_REALTIME_BARGE_IN_CUT, reconstruct_output
 from benchmarks.duplex.v15_runner import run_samples
 from tests.unit_test.benchmarks.openai_fakes import (
@@ -32,7 +35,11 @@ from tests.unit_test.benchmarks.openai_fakes import (
     StrictFake,
     utterance_pcm,
 )
-from tests.unit_test.fixtures.duplex_fakes import SERVER, write_dataset
+from tests.unit_test.fixtures.duplex_fakes import (
+    SERVER,
+    write_dataset,
+    write_v10_dataset,
+)
 
 SENTINEL_KEY = "sk-sentinel-must-not-leak-4f1c"
 INSTRUCTIONS = "Answer in one short sentence."
@@ -43,6 +50,9 @@ SERVER_VAD = TurnDetection(type="server_vad", silence_duration_ms=800)
 # stream is exactly bytes [k * 2560, (k + 1) * 2560).
 CLEAN_TURN = [("voice", 0.48), ("silence", 1.12)]
 BARGE_IN = [("voice", 0.48), ("silence", 1.2), ("voice", 0.48), ("silence", 0.96)]
+# note (wenyao): the reply ends inside the input, so Realtime stays silent through
+# the 10 s tail and only the transport pongs show its receiver alive after it.
+REPLY_IN_WINDOW = [("voice", 0.48), ("silence", 2.88)]
 
 
 @pytest.fixture
@@ -500,3 +510,95 @@ def test_run_samples_records_an_openai_wire_end_to_end(
         manifest_text
     )
     assert_no_key_on_disk(provider)
+
+
+@pytest.mark.parametrize(
+    ("profile", "fake_type", "turn_detection", "trace_format"),
+    [
+        (
+            "openai-realtime",
+            RealtimeFake,
+            SERVER_VAD,
+            TraceFormat.TURN_BASED_PCM16,
+        ),
+        ("openai-live", LiveFake, None, TraceFormat.PCM16),
+    ],
+)
+def test_reference_exports_take_sessions_with_a_silent_tail(
+    provider: Path,
+    profile: str,
+    fake_type: type[StrictFake],
+    turn_detection: TurnDetection | None,
+    trace_format: TraceFormat,
+) -> None:
+    v15_data, v10_data = provider.parent / "v15-data", provider.parent / "v10-data"
+    write_dataset(v15_data)
+    write_v10_dataset(v10_data)
+    speech = np.frombuffer(utterance_pcm(REPLY_IN_WINDOW, 16000), dtype="<i2")
+    for source in (
+        v15_data / "user_interruption/1/input.wav",
+        v15_data / "user_interruption/1/clean_input.wav",
+        v10_data / "synthetic_user_interruption/1/input.wav",
+    ):
+        soundfile.write(str(source), speech, 16000, subtype="PCM_16")
+    fake = fake_type(api_key=SENTINEL_KEY, reply_s=1.0)
+    settings: dict = dict(
+        server=SERVER,
+        dataset_revision="fixture",
+        timeout_s=30.0,
+        profile=profile,
+        concurrency=2,
+        turn_detection=turn_detection,
+        report_playback=turn_detection is not None,
+        tail_silence_s=10.0,
+        end_wait_s=8.0,
+    )
+
+    async def scenario() -> None:
+        async with fake.serve() as url:
+            await asyncio.gather(
+                run_samples(
+                    v15_data,
+                    url=url,
+                    output=provider / "v15",
+                    sample_ids=["user_interruption/1"],
+                    **settings,
+                ),
+                run_samples(
+                    v10_data,
+                    url=url,
+                    output=provider / "v10",
+                    sample_ids=["synthetic_user_interruption/1"],
+                    dataset=v10_dataset,
+                    variants={"input": "input"},
+                    kind=v10_dataset.RUN_KIND,
+                    **settings,
+                ),
+            )
+
+    asyncio.run(scenario())
+    v15 = export_runs(
+        [provider / "v15"],
+        provider.parent / "v15-export",
+        "fake",
+        dataset_root=v15_data,
+        sample_ids=["user_interruption/1"],
+        trace_format=trace_format.value,
+    )
+    v10 = export_v10(
+        [provider / "v10"], v10_data, provider.parent / "v10-export", trace_format.value
+    )
+
+    ((v15_sample,), (v10_sample,)) = v15["samples"], v10["samples"]
+    assert {
+        name: variant["reasons"] for name, variant in v15_sample["variants"].items()
+    } == {"overlap": [], "clean": []}
+    assert v10_sample["reasons"] == []
+    for output in (
+        provider.parent / "v15-export/user_interruption/1/output.wav",
+        provider.parent / "v15-export/user_interruption/1/clean_output.wav",
+        provider.parent / "v10-export/synthetic_user_interruption/1/output.wav",
+    ):
+        audio, rate = soundfile.read(str(output), dtype="int16")
+        assert rate == 16000 and len(audio) == len(speech)
+        assert np.abs(audio).max() > 1000

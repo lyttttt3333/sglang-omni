@@ -434,20 +434,20 @@ def test_live_stops_talking_soon_after_the_caller_speaks_over_it() -> None:
     assert audio_s(deltas, 16000) < 2.0
 
 
-def test_live_streams_quiet_frames_at_real_time_between_replies() -> None:
+def test_live_streams_quiet_frames_at_real_time_from_the_first_append() -> None:
     fake = LiveFake(api_key=KEY, reply_s=0.5, output_speed=4.0)
     pcm = utterance_pcm([("voice", 0.4), ("silence", 1.2)], 16000)
-    events, _ = asyncio.run(live_session(fake, pcm, 1.0))
+    events, sent_s = asyncio.run(live_session(fake, pcm, 1.0))
     deltas = [e for e in events if e["type"] == "session.output_audio.delta"]
     quiet = [e for e in deltas if rms(e) <= QUIET_AMPLITUDE]
-    started_s = events[0]["at_s"]
     closed_s = events[-1]["at_s"]
 
     assert events[0]["type"] == "session.started"
     assert events[0]["session"]["delegation"] == {"type": "client"}
+    assert deltas[0]["at_s"] > sent_s[0]
     assert audio_s(speech(deltas), 16000) == pytest.approx(0.5)
     assert audio_s(quiet, 16000) == pytest.approx(
-        closed_s - started_s - 0.5 / 4.0, abs=0.25
+        closed_s - sent_s[0] - 0.5 / 4.0, abs=0.25
     )
     assert max(b["at_s"] - a["at_s"] for a, b in zip(deltas, deltas[1:])) < 0.2
     assert [rms(e) for e in quiet] == pytest.approx(

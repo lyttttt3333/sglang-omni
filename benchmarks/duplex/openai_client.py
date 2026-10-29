@@ -265,7 +265,21 @@ def live_translate(event: dict[str, JsonValue]) -> list[dict[str, JsonValue]]:
     canonical_type = (
         LIVE_CANONICAL_TYPES.get(event_type) if isinstance(event_type, str) else None
     )
-    if canonical_type is None:
+    if event_type == "session.started":
+        # note (wenyao): Live sets one audio format for both directions, so the
+        # acknowledgment declares it as the output format, as Realtime's does.
+        session = event.get("session") or {}
+        audio = session.get("audio") or {}
+        output = {**(audio.get("output") or {}), "format": audio.get("format")}
+        return [
+            {
+                **event,
+                "type": "session.updated",
+                "session": {**session, "audio": {**audio, "output": output}},
+                "wire_type": event_type,
+            }
+        ]
+    elif canonical_type is None:
         return [event]
     else:
         return [
@@ -567,7 +581,7 @@ DIALECTS: dict[ProviderWire, Dialect] = {
         greeting=None,
         configure_type="session.start",
         configure=live_configure,
-        acknowledgment="session.started",
+        acknowledgment="session.updated",
         echoed=(
             ("audio", "format", "type"),
             ("audio", "format", "rate"),
