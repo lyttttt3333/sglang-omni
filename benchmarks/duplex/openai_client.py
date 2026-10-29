@@ -78,6 +78,8 @@ END_OF_INPUT_RULES: dict[ProviderWire, str] = {
     "without ACTIVITY_END, then a WebSocket close with code 1000",
 }
 GEMINI_INPUT_MIME_TYPE = f"audio/pcm;rate={SAMPLE_RATE}"
+GEMINI_OUTPUT_RATE = 24000
+GEMINI_OUTPUT_MIME_TYPE = f"audio/pcm;rate={GEMINI_OUTPUT_RATE}"
 GEMINI_VAD_FIELDS = {
     "silence_duration_ms": "silenceDurationMs",
     "prefix_padding_ms": "prefixPaddingMs",
@@ -350,6 +352,36 @@ class GeminiTurns:
 
     response_id: str | None = None
     interrupted_id: str | None = None
+    # note (jeffro): outputTranscription can lead the turn's first audio part, so
+    # text that arrives before a response opens joins the next one.
+    unopened_transcript: str = ""
+    transcripts: dict[str, str] = field(default_factory=dict)
+
+    def done(
+        self, response_id: str, status: str, usage: JsonValue
+    ) -> dict[str, JsonValue]:
+        """A response.done whose output carries the turn's transcript the way an
+        OpenAI response does."""
+        return {
+            "type": "response.done",
+            "response": {
+                "id": response_id,
+                "status": status,
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_audio",
+                                "transcript": self.transcripts[response_id],
+                            }
+                        ],
+                    }
+                ],
+                **({"usage": usage} if usage is not None else {}),
+            },
+        }
 
     def translate(self, frame: dict[str, JsonValue]) -> list[dict[str, JsonValue]]:
         events: list[dict[str, JsonValue]] = []
@@ -357,7 +389,24 @@ class GeminiTurns:
         for name, value in frame.items():
             activity = value.get("type") if isinstance(value, dict) else None
             if name == "setupComplete":
-                events.append({"type": "session.updated"})
+                # note (jeffro): setupComplete is empty and Live output is fixed at
+                # 24 kHz PCM16, so the acknowledgment declares that rate and every
+                # audio part is held to it.
+                events.append(
+                    {
+                        "type": "session.updated",
+                        "session": {
+                            "audio": {
+                                "output": {
+                                    "format": {
+                                        "type": "audio/pcm",
+                                        "rate": GEMINI_OUTPUT_RATE,
+                                    }
+                                }
+                            }
+                        },
+                    }
+                )
             elif name == "voiceActivity" and activity in GEMINI_ACTIVITY_EVENTS:
                 events.append(
                     {
@@ -369,7 +418,7 @@ class GeminiTurns:
                 events.extend(self.server_content(value, usage))
             else:
                 events.append({"type": f"gemini.{name}", name: value})
-        return events
+        return [{**event, "event_id": uuid.uuid4().hex} for event in events]
 
     def server_content(
         self, content: dict[str, JsonValue], usage: JsonValue
@@ -390,9 +439,20 @@ class GeminiTurns:
                     inline = part.get("inlineData") if isinstance(part, dict) else None
                     audio = inline.get("data") if isinstance(inline, dict) else None
                     if isinstance(audio, str) and audio:
+                        if inline.get("mimeType") != GEMINI_OUTPUT_MIME_TYPE:
+                            raise ValueError(
+                                f"audio part {inline.get('mimeType')!r} is not "
+                                f"{GEMINI_OUTPUT_MIME_TYPE}"
+                            )
+                        else:
+                            pass
                         if self.response_id is None:
                             self.response_id = uuid.uuid4().hex
                             self.interrupted_id = None
+                            self.transcripts[self.response_id] = (
+                                self.unopened_transcript
+                            )
+                            self.unopened_transcript = ""
                             events.append(
                                 {
                                     "type": "response.created",
@@ -415,6 +475,10 @@ class GeminiTurns:
                     else:
                         events.append({"type": "gemini.modelTurn.part", "part": part})
             elif name == "outputTranscription" and text_field(value) is not None:
+                if self.response_id is None:
+                    self.unopened_transcript += text_field(value)
+                else:
+                    self.transcripts[self.response_id] += text_field(value)
                 events.append(
                     {
                         "type": "response.output_audio_transcript.delta",
@@ -423,38 +487,15 @@ class GeminiTurns:
                     }
                 )
             elif name == "interrupted" and value is True and self.response_id:
-                events.append(
-                    {
-                        "type": "response.done",
-                        "response": {"id": self.response_id, "status": "cancelled"},
-                    }
-                )
+                events.append(self.done(self.response_id, "cancelled", None))
                 self.response_id, self.interrupted_id = None, self.response_id
             elif name == "turnComplete" and value is True and self.response_id:
-                events.append(
-                    {
-                        "type": "response.done",
-                        "response": {
-                            "id": self.response_id,
-                            "status": "completed",
-                            "usage": usage,
-                        },
-                    }
-                )
+                events.append(self.done(self.response_id, "completed", usage))
                 self.response_id = None
             elif name == "turnComplete" and value is True and self.interrupted_id:
                 # note (jeffro): The usage of an interrupted turn arrives with its
                 # turnComplete, so the cancelled response.done is reported again.
-                events.append(
-                    {
-                        "type": "response.done",
-                        "response": {
-                            "id": self.interrupted_id,
-                            "status": "cancelled",
-                            "usage": usage,
-                        },
-                    }
-                )
+                events.append(self.done(self.interrupted_id, "cancelled", usage))
                 self.interrupted_id = None
             else:
                 events.append({"type": f"gemini.{name}", name: value})
@@ -883,9 +924,21 @@ async def run_openai_session(
                             pong = await websocket.ping()
                         except websockets.ConnectionClosed:
                             return
+                        # note (jeffro): A pong is in the trace so a silent provider
+                        # still proves its receiver alive after the input window.
                         pong.add_done_callback(
                             lambda done: (
-                                rtt_samples_s.append(done.result())
+                                (
+                                    rtt_samples_s.append(done.result()),
+                                    record(
+                                        "receive",
+                                        {
+                                            "type": "transport.pong",
+                                            "event_id": uuid.uuid4().hex,
+                                            "rtt_s": done.result(),
+                                        },
+                                    ),
+                                )
                                 if not done.cancelled() and done.exception() is None
                                 else None
                             )

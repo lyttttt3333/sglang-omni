@@ -876,6 +876,9 @@ def test_gemini_session_records_model_turns_and_a_barge_in(
         if event["type"] == "response.output_audio_transcript.delta"
     )
     assert transcript["response_id"] is None
+    assert done[0]["output"][0]["content"] == [
+        {"type": "output_audio", "transcript": "hi"}
+    ]
     assert "gemini.generationComplete" in report["metrics"]["server_events"]
 
     playout = reconstruct_output(tmp_path, profile="gemini-live")
@@ -887,6 +890,8 @@ def test_gemini_session_records_model_turns_and_a_barge_in(
     assert 0 < cut["dropped_samples"] < reply_samples
     written = [path for path in tmp_path.rglob("*") if path.is_file()]
     assert not [path for path in written if API_KEY.encode() in path.read_bytes()]
+    (tmp_path / "input.pcm").write_bytes(PCM)
+    assert score_session(tmp_path, "gemini-live", 0.0)["replies"]
 
 
 def test_gemini_turn_detection_maps_only_what_activity_detection_has(
