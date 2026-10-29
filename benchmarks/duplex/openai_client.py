@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Record OpenAI Realtime and Live sessions in the trace vocabulary of the sglang wire."""
+"""Record OpenAI Realtime, OpenAI Live and Gemini Live sessions in the trace vocabulary
+of the sglang wire."""
 
 from __future__ import annotations
 
@@ -39,7 +40,7 @@ from benchmarks.duplex.client import (
 )
 from benchmarks.duplex.profiles import PROFILES, ProfileName, Wire
 
-OpenAIWire = Literal["openai-realtime", "openai-live"]
+ProviderWire = Literal["openai-realtime", "openai-live", "gemini-live"]
 WIRE_FILE = "wire.jsonl"
 RTT_FILE = "rtt.json"
 PING_INTERVAL_S = 1.0
@@ -49,12 +50,22 @@ LIVE_QUIET_S = 2.0
 # above this RMS counts as speech for the end-of-input wait.
 LIVE_SPEECH_RMS = 100.0
 LIVE_CLOSE_WAIT_S = 15.0
-DEFAULT_MODELS: dict[OpenAIWire, str] = {
+DEFAULT_MODELS: dict[ProviderWire, str] = {
     "openai-realtime": "gpt-realtime-2.1",
     "openai-live": "gpt-live-1",
+    "gemini-live": "gemini-3.8-live",
 }
-DEFAULT_VOICE = "marin"
-END_OF_INPUT_RULES: dict[OpenAIWire, str] = {
+DEFAULT_VOICES: dict[ProviderWire, str] = {
+    "openai-realtime": "marin",
+    "openai-live": "marin",
+    "gemini-live": "Puck",
+}
+ENV_PREFIXES: dict[ProviderWire, str] = {
+    "openai-realtime": "OPENAI",
+    "openai-live": "OPENAI",
+    "gemini-live": "GEMINI",
+}
+END_OF_INPUT_RULES: dict[ProviderWire, str] = {
     "openai-realtime": "after the input end, at most end_wait_s until every "
     "response.created has its response.done and no speech_started is open without "
     "speech_stopped, then a WebSocket close with code 1000",
@@ -62,12 +73,25 @@ END_OF_INPUT_RULES: dict[OpenAIWire, str] = {
     f"audio (a delta with int16 RMS above {LIVE_SPEECH_RMS}) arrived for "
     f"{LIVE_QUIET_S}s, then session.close and at most {LIVE_CLOSE_WAIT_S}s for "
     "session.closed",
+    "gemini-live": "after the input end, at most end_wait_s until every model turn has "
+    "ended by turnComplete or interrupted and no voiceActivity ACTIVITY_START is open "
+    "without ACTIVITY_END, then a WebSocket close with code 1000",
+}
+GEMINI_INPUT_MIME_TYPE = f"audio/pcm;rate={SAMPLE_RATE}"
+GEMINI_VAD_FIELDS = {
+    "silence_duration_ms": "silenceDurationMs",
+    "prefix_padding_ms": "prefixPaddingMs",
+}
+GEMINI_ACTIVITY_EVENTS = {
+    "ACTIVITY_START": "input_audio_buffer.speech_started",
+    "ACTIVITY_END": "input_audio_buffer.speech_stopped",
 }
 
 
 @dataclass(frozen=True)
 class Provider:
-    """OpenAI settings read from the environment; the key reaches only the socket."""
+    """Provider settings read from the environment, OPENAI_* or GEMINI_* by wire; the
+    key reaches only the socket and the model probe."""
 
     api_key: str = field(repr=False)
     model: str
@@ -75,17 +99,18 @@ class Provider:
     instructions: str | None
 
     @classmethod
-    def from_env(cls, wire: OpenAIWire) -> Provider:
-        api_key = os.environ.get("OPENAI_API_KEY")
+    def from_env(cls, wire: ProviderWire) -> Provider:
+        prefix = ENV_PREFIXES[wire]
+        api_key = os.environ.get(f"{prefix}_API_KEY")
         if not api_key:
-            raise ValueError(f"{wire} sessions require OPENAI_API_KEY")
+            raise ValueError(f"{wire} sessions require {prefix}_API_KEY")
         else:
             pass
-        instructions_file = os.environ.get("OPENAI_DUPLEX_INSTRUCTIONS_FILE")
+        instructions_file = os.environ.get(f"{prefix}_DUPLEX_INSTRUCTIONS_FILE")
         return cls(
             api_key=api_key,
-            model=os.environ.get("OPENAI_DUPLEX_MODEL") or DEFAULT_MODELS[wire],
-            voice=os.environ.get("OPENAI_DUPLEX_VOICE") or DEFAULT_VOICE,
+            model=os.environ.get(f"{prefix}_DUPLEX_MODEL") or DEFAULT_MODELS[wire],
+            voice=os.environ.get(f"{prefix}_DUPLEX_VOICE") or DEFAULT_VOICES[wire],
             instructions=(
                 Path(instructions_file).read_text(encoding="utf-8")
                 if instructions_file
@@ -118,10 +143,11 @@ def provider_manifest(profile: ProfileName, url: str) -> dict[str, JsonValue] | 
 
 
 def served_model(profile: ProfileName, url: str) -> dict[str, JsonValue]:
-    """GET /v1/models/{model} with the key: the HTTP status and the id it answers,
-    which show that the account serves the model without recording its card."""
+    """GET the model card with the key: the HTTP status and the id it answers, which
+    show that the account serves the model without recording its card."""
     wire = PROFILES[profile].wire
     assert wire != "sglang"
+    dialect = DIALECTS[wire]
     provider = Provider.from_env(wire)
     parts = urlsplit(url)
     scheme = {"ws": "http", "wss": "https"}.get(parts.scheme, parts.scheme)
@@ -130,12 +156,12 @@ def served_model(profile: ProfileName, url: str) -> dict[str, JsonValue]:
             (
                 scheme,
                 parts.netloc,
-                f"/v1/models/{quote(provider.model, safe='')}",
+                dialect.model_path.format(model=quote(provider.model, safe="")),
                 "",
                 "",
             )
         ),
-        headers={"Authorization": f"Bearer {provider.api_key}"},
+        headers=dialect.auth_headers(provider),
     )
     # note (wenyao): A failed probe is recorded; it must not block the benchmark.
     try:
@@ -143,7 +169,7 @@ def served_model(profile: ProfileName, url: str) -> dict[str, JsonValue]:
             card = json.load(response)
         return {
             "status": response.status,
-            "id": card.get("id") if isinstance(card, dict) else None,
+            "id": card.get(dialect.model_card_id) if isinstance(card, dict) else None,
         }
     except urllib.error.HTTPError as exc:
         return {"status": exc.code, "id": None}
@@ -232,26 +258,218 @@ LIVE_CANONICAL_TYPES = {
 }
 
 
-def live_translate(event: dict[str, JsonValue]) -> dict[str, JsonValue]:
-    canonical_type = LIVE_CANONICAL_TYPES.get(event["type"])
+def live_translate(event: dict[str, JsonValue]) -> list[dict[str, JsonValue]]:
+    event_type = event.get("type")
+    canonical_type = (
+        LIVE_CANONICAL_TYPES.get(event_type) if isinstance(event_type, str) else None
+    )
     if canonical_type is None:
-        return event
+        return [event]
     else:
+        return [
+            {
+                **event,
+                "type": canonical_type,
+                "response_id": None,
+                "item_id": None,
+                "wire_type": event["type"],
+            }
+        ]
+
+
+def gemini_configure(
+    provider: Provider, turn_detection: TurnDetection | None
+) -> dict[str, JsonValue]:
+    """The BidiGenerateContent setup: audio out with both transcriptions, and the
+    server_vad fields that automatic activity detection has."""
+    assert turn_detection is not None
+    settings = turn_detection.model_dump(mode="json")
+    if settings.pop("type") != "server_vad":
+        raise ValueError("gemini-live takes turns by server_vad only")
+    else:
+        pass
+    detection = {
+        GEMINI_VAD_FIELDS[name]: settings.pop(name)
+        for name in [*settings]
+        if name in GEMINI_VAD_FIELDS
+    }
+    interrupts = settings.pop("interrupt_response", True)
+    if settings:
+        raise ValueError(f"gemini-live has no turn_detection fields {sorted(settings)}")
+    else:
+        pass
+    return {
+        "model": f"models/{provider.model}",
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": provider.voice}}
+            },
+        },
+        **(
+            {"systemInstruction": {"parts": [{"text": provider.instructions}]}}
+            if provider.instructions is not None
+            else {}
+        ),
+        "realtimeInputConfig": {
+            "automaticActivityDetection": detection,
+            "activityHandling": (
+                "START_OF_ACTIVITY_INTERRUPTS" if interrupts else "NO_INTERRUPTION"
+            ),
+        },
+        "inputAudioTranscription": {},
+        "outputAudioTranscription": {},
+    }
+
+
+def gemini_frame(event: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    """The Gemini frame for a canonical client event; Gemini rejects unknown fields,
+    so the event_id stays in the canonical trace."""
+    if event["type"] == "session.update":
+        return {"setup": event["session"]}
+    elif event["type"] == "input_audio_buffer.append":
         return {
-            **event,
-            "type": canonical_type,
-            "response_id": None,
-            "item_id": None,
-            "wire_type": event["type"],
+            "realtimeInput": {
+                "audio": {"data": event["audio"], "mimeType": GEMINI_INPUT_MIME_TYPE}
+            }
         }
+    else:
+        raise ValueError(f"gemini-live has no client event for {event['type']}")
+
+
+def text_field(value: JsonValue) -> str | None:
+    text = value.get("text") if isinstance(value, dict) else None
+    return text if isinstance(text, str) and text else None
+
+
+@dataclass
+class GeminiTurns:
+    """Gemini frames as canonical events: each model turn is one response that opens
+    at its first audio and ends cancelled at interrupted or completed at turnComplete.
+    Frames and flags with no canonical event pass through as gemini.<field>."""
+
+    response_id: str | None = None
+    interrupted_id: str | None = None
+
+    def translate(self, frame: dict[str, JsonValue]) -> list[dict[str, JsonValue]]:
+        events: list[dict[str, JsonValue]] = []
+        usage = frame.get("usageMetadata")
+        for name, value in frame.items():
+            activity = value.get("type") if isinstance(value, dict) else None
+            if name == "setupComplete":
+                events.append({"type": "session.updated"})
+            elif name == "voiceActivity" and activity in GEMINI_ACTIVITY_EVENTS:
+                events.append(
+                    {
+                        "type": GEMINI_ACTIVITY_EVENTS[activity],
+                        "audio_offset": value.get("audioOffset"),
+                    }
+                )
+            elif name == "serverContent" and isinstance(value, dict):
+                events.extend(self.server_content(value, usage))
+            else:
+                events.append({"type": f"gemini.{name}", name: value})
+        return events
+
+    def server_content(
+        self, content: dict[str, JsonValue], usage: JsonValue
+    ) -> list[dict[str, JsonValue]]:
+        events: list[dict[str, JsonValue]] = []
+        model_turn = content.get("modelTurn")
+        parts = model_turn.get("parts") if isinstance(model_turn, dict) else None
+        for name, value in content.items():
+            if name == "inputTranscription" and text_field(value) is not None:
+                events.append(
+                    {
+                        "type": "conversation.item.input_audio_transcription.delta",
+                        "delta": text_field(value),
+                    }
+                )
+            elif name == "modelTurn":
+                for part in parts if isinstance(parts, list) else []:
+                    inline = part.get("inlineData") if isinstance(part, dict) else None
+                    audio = inline.get("data") if isinstance(inline, dict) else None
+                    if isinstance(audio, str) and audio:
+                        if self.response_id is None:
+                            self.response_id = uuid.uuid4().hex
+                            self.interrupted_id = None
+                            events.append(
+                                {
+                                    "type": "response.created",
+                                    "response": {
+                                        "id": self.response_id,
+                                        "status": "in_progress",
+                                    },
+                                }
+                            )
+                        else:
+                            pass
+                        events.append(
+                            {
+                                "type": "response.output_audio.delta",
+                                "response_id": self.response_id,
+                                "item_id": self.response_id,
+                                "delta": audio,
+                            }
+                        )
+                    else:
+                        events.append({"type": "gemini.modelTurn.part", "part": part})
+            elif name == "outputTranscription" and text_field(value) is not None:
+                events.append(
+                    {
+                        "type": "response.output_audio_transcript.delta",
+                        "response_id": self.response_id,
+                        "delta": text_field(value),
+                    }
+                )
+            elif name == "interrupted" and value is True and self.response_id:
+                events.append(
+                    {
+                        "type": "response.done",
+                        "response": {"id": self.response_id, "status": "cancelled"},
+                    }
+                )
+                self.response_id, self.interrupted_id = None, self.response_id
+            elif name == "turnComplete" and value is True and self.response_id:
+                events.append(
+                    {
+                        "type": "response.done",
+                        "response": {
+                            "id": self.response_id,
+                            "status": "completed",
+                            "usage": usage,
+                        },
+                    }
+                )
+                self.response_id = None
+            elif name == "turnComplete" and value is True and self.interrupted_id:
+                # note (jeffro): The usage of an interrupted turn arrives with its
+                # turnComplete, so the cancelled response.done is reported again.
+                events.append(
+                    {
+                        "type": "response.done",
+                        "response": {
+                            "id": self.interrupted_id,
+                            "status": "cancelled",
+                            "usage": usage,
+                        },
+                    }
+                )
+                self.interrupted_id = None
+            else:
+                events.append({"type": f"gemini.{name}", name: value})
+        return events
 
 
 @dataclass(frozen=True)
 class Dialect:
-    """How one OpenAI wire speaks the session the sglang wire records."""
+    """How one provider wire speaks the session the sglang wire records."""
 
     input_rate: int
     connect_url: Callable[[str, Provider], str]
+    auth_headers: Callable[[Provider], dict[str, str]]
+    model_path: str
+    model_card_id: str
     # note (wenyao): Realtime announces session.created before it accepts
     # session.update; Live takes session.start as the first frame.
     greeting: str | None
@@ -262,16 +480,25 @@ class Dialect:
     # format, and the turn detector (Realtime) or client delegation (Live).
     echoed: tuple[tuple[str, ...], ...]
     append_type: str
+    # note (jeffro): The frame on the socket for each canonical client event.
+    wire_frame: Callable[[dict[str, JsonValue]], dict[str, JsonValue]]
     settle: Callable[[SessionState], Awaitable[None]]
     close_type: str | None
     closed_type: str | None
-    translate: Callable[[dict[str, JsonValue]], dict[str, JsonValue]]
+    # note (jeffro): A new translator per session; one wire frame can carry several
+    # canonical events, and Gemini numbers its model turns itself.
+    translator: Callable[
+        [], Callable[[dict[str, JsonValue]], list[dict[str, JsonValue]]]
+    ]
 
 
-DIALECTS: dict[OpenAIWire, Dialect] = {
+DIALECTS: dict[ProviderWire, Dialect] = {
     "openai-realtime": Dialect(
         input_rate=24000,
         connect_url=realtime_url,
+        auth_headers=lambda provider: {"Authorization": f"Bearer {provider.api_key}"},
+        model_path="/v1/models/{model}",
+        model_card_id="id",
         greeting="session.created",
         configure_type="session.update",
         configure=realtime_configure,
@@ -284,14 +511,18 @@ DIALECTS: dict[OpenAIWire, Dialect] = {
             ("audio", "input", "turn_detection", "type"),
         ),
         append_type="input_audio_buffer.append",
+        wire_frame=lambda event: event,
         settle=responses_settled,
         close_type=None,
         closed_type=None,
-        translate=lambda event: event,
+        translator=lambda: lambda event: [event],
     ),
     "openai-live": Dialect(
         input_rate=SAMPLE_RATE,
         connect_url=lambda url, provider: url,
+        auth_headers=lambda provider: {"Authorization": f"Bearer {provider.api_key}"},
+        model_path="/v1/models/{model}",
+        model_card_id="id",
         greeting=None,
         configure_type="session.start",
         configure=live_configure,
@@ -302,10 +533,30 @@ DIALECTS: dict[OpenAIWire, Dialect] = {
             ("delegation", "type"),
         ),
         append_type="session.input_audio.append",
+        wire_frame=lambda event: event,
         settle=speech_quiet,
         close_type="session.close",
         closed_type="session.closed",
-        translate=live_translate,
+        translator=lambda: live_translate,
+    ),
+    "gemini-live": Dialect(
+        input_rate=SAMPLE_RATE,
+        connect_url=lambda url, provider: url,
+        auth_headers=lambda provider: {"x-goog-api-key": provider.api_key},
+        model_path="/v1beta/models/{model}",
+        model_card_id="name",
+        greeting=None,
+        configure_type="session.update",
+        configure=gemini_configure,
+        acknowledgment="session.updated",
+        # note (jeffro): setupComplete is empty, so it can echo nothing.
+        echoed=(),
+        append_type="input_audio_buffer.append",
+        wire_frame=gemini_frame,
+        settle=responses_settled,
+        close_type=None,
+        closed_type=None,
+        translator=lambda: GeminiTurns().translate,
     ),
 }
 
@@ -360,7 +611,7 @@ async def run_openai_session(
     tail_silence_s: float,
     end_wait_s: float | None,
 ) -> None:
-    """run_session for an OpenAI wire: the canonical trace, plus wire.jsonl with every
+    """run_session for a provider wire: the canonical trace, plus wire.jsonl with every
     frame as sent or received and rtt.json with WebSocket ping round trips."""
     if not pcm or len(pcm) % 2:
         raise ValueError("Input must be nonempty PCM16")
@@ -369,6 +620,12 @@ async def run_openai_session(
     profile_protocol(profile, turn_detection)
     wire: Wire = PROFILES[profile].wire
     assert wire != "sglang"
+    if report_playback and wire == "gemini-live":
+        raise ValueError(
+            "gemini-live has no truncate; its server cuts its own playout clock"
+        )
+    else:
+        pass
     dialect = DIALECTS[wire]
     provider = Provider.from_env(wire)
     tail_bytes = round(tail_silence_s * SAMPLE_RATE) * 2
@@ -435,12 +692,13 @@ async def run_openai_session(
         async def exchange() -> None:
             async with websockets.connect(
                 dialect.connect_url(url, provider),
-                additional_headers={"Authorization": f"Bearer {provider.api_key}"},
+                additional_headers=dialect.auth_headers(provider),
                 max_size=MAX_MESSAGE_BYTES,
                 compression=None,
                 ping_interval=None,
             ) as websocket:
                 state = SessionState()
+                translate = dialect.translator()
                 player = ZeroBufferPlayer(
                     output_rate,
                     session_cuts(
@@ -455,8 +713,9 @@ async def run_openai_session(
 
                 async def send(event: dict[str, JsonValue]) -> None:
                     event = {**event, "event_id": uuid.uuid4().hex}
-                    record("send", event, event)
-                    await websocket.send(json.dumps(event))
+                    wire_event = dialect.wire_frame(event)
+                    record("send", event, wire_event)
+                    await websocket.send(json.dumps(wire_event))
 
                 # note (wenyao): Until the session is configured an error answers the
                 # awaited event; later errors are recorded and the session goes on.
@@ -474,10 +733,16 @@ async def run_openai_session(
                 async def receive() -> None:
                     async for frame in websocket:
                         try:
+                            # note (jeffro): Gemini sends its JSON in binary frames.
                             wire_event = json.loads(frame)
                             if not isinstance(wire_event, dict):
                                 raise ValueError("server event must be a JSON object")
-                            elif not isinstance(wire_event.get("type"), str):
+                            else:
+                                pass
+                            events = translate(wire_event)
+                            if not all(
+                                isinstance(event.get("type"), str) for event in events
+                            ):
                                 raise ValueError("server event type must be a string")
                             else:
                                 pass
@@ -487,37 +752,42 @@ async def run_openai_session(
                                 f"{frame[:FRAME_EXCERPT_CHARS]!r}: "
                                 f"{type(exc).__name__}: {exc}"
                             ) from exc
-                        event = dialect.translate(wire_event)
-                        received_s = record("receive", event, wire_event)
-                        event_type = event["type"]
-                        response_id = (event.get("response") or {}).get("id")
-                        if event_type == "response.created":
-                            state.open_responses.add(response_id)
-                        elif event_type == "response.done":
-                            state.open_responses.discard(response_id)
-                        elif event_type == "input_audio_buffer.speech_started":
-                            state.speech_open = True
-                        elif event_type == "input_audio_buffer.speech_stopped":
-                            state.speech_open = False
-                        elif (
-                            event_type == "response.output_audio.delta"
-                            and pcm_rms(event["delta"]) > LIVE_SPEECH_RMS
-                        ):
-                            state.last_speech_s = received_s
-                        else:
-                            pass
-                        for truncate in (
-                            player.played(event, received_s) if report_playback else []
-                        ):
-                            await send(
-                                {"type": "conversation.item.truncate", **truncate}
+                        for index, event in enumerate(events):
+                            received_s = record(
+                                "receive", event, wire_event if index == 0 else None
                             )
-                        async with state.changed:
-                            state.latest[event_type] = event
-                            state.changed.notify_all()
+                            event_type = event["type"]
+                            response_id = (event.get("response") or {}).get("id")
+                            if event_type == "response.created":
+                                state.open_responses.add(response_id)
+                            elif event_type == "response.done":
+                                state.open_responses.discard(response_id)
+                            elif event_type == "input_audio_buffer.speech_started":
+                                state.speech_open = True
+                            elif event_type == "input_audio_buffer.speech_stopped":
+                                state.speech_open = False
+                            elif (
+                                event_type == "response.output_audio.delta"
+                                and pcm_rms(event["delta"]) > LIVE_SPEECH_RMS
+                            ):
+                                state.last_speech_s = received_s
+                            else:
+                                pass
+                            for truncate in (
+                                player.played(event, received_s)
+                                if report_playback
+                                else []
+                            ):
+                                await send(
+                                    {"type": "conversation.item.truncate", **truncate}
+                                )
+                            async with state.changed:
+                                state.latest[event_type] = event
+                                state.changed.notify_all()
                     if not state.closing:
                         raise RuntimeError(
-                            "server closed the connection before the end of input"
+                            "server closed the connection before the end of input "
+                            f"(code {websocket.close_code}: {websocket.close_reason!r})"
                         )
                     else:
                         pass
@@ -550,11 +820,13 @@ async def run_openai_session(
                             )
                         )
                         event_id = uuid.uuid4().hex
-                        wire_event = {
-                            "type": dialect.append_type,
-                            "event_id": event_id,
-                            "audio": wire_audio[sequence],
-                        }
+                        wire_event = dialect.wire_frame(
+                            {
+                                "type": dialect.append_type,
+                                "event_id": event_id,
+                                "audio": wire_audio[sequence],
+                            }
+                        )
                         send_started_s = record(
                             "send",
                             {

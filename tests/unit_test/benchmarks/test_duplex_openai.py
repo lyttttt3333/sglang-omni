@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""OpenAI Realtime and Live wires: recording, canonical trace, oracle, serving."""
+"""OpenAI Realtime, OpenAI Live and Gemini Live wires: recording, canonical trace,
+oracle, serving."""
 
 from __future__ import annotations
 
@@ -27,6 +28,7 @@ from benchmarks.duplex.openai_client import (
     DEFAULT_MODELS,
     DIALECTS,
     echo_mismatches,
+    gemini_configure,
     provider_manifest,
 )
 from benchmarks.duplex.oracle import evaluate_trace
@@ -279,6 +281,69 @@ def realtime(peer: RealtimePeer, variant_dir: Path, **session_args):
 
 def live(peer: LivePeer, variant_dir: Path):
     return asyncio.run(record_session(peer.handler, variant_dir, "openai-live"))
+
+
+class GeminiPeer:
+    """Fake Gemini Live server: speech from the second append, a reply at the fourth
+    that the user interrupts at the sixth, and a second reply at the eighth. Like
+    the real server it answers in binary frames and closes with 1007 on an unknown
+    field."""
+
+    def __init__(self) -> None:
+        self.received: list[dict[str, JsonValue]] = []
+        self.api_key: str | None = None
+        self.authorization: str | None = None
+
+    async def handler(self, websocket: ServerConnection) -> None:
+        self.api_key = websocket.request.headers.get("x-goog-api-key")
+        self.authorization = websocket.request.headers.get("Authorization")
+        reply = {"inlineData": {"mimeType": "audio/pcm;rate=24000"}}
+        reply["inlineData"]["data"] = encode(bytes(2 * round(24000 * REPLY_SECONDS)))
+        usage = {"usageMetadata": {"promptTokenCount": 7, "responseTokenCount": 3}}
+        async for frame in websocket:
+            event = json.loads(frame)
+            self.received.append(event)
+            audio = (event.get("realtimeInput") or {}).get("audio") or {}
+            if set(event) == {"setup"}:
+                outgoing = [{"setupComplete": {}}]
+            elif set(event) == {"realtimeInput"} and set(audio) == {"data", "mimeType"}:
+                appends = len(self.received) - 1
+                outgoing = {
+                    2: [{"voiceActivity": {"type": "ACTIVITY_START"}}],
+                    4: [
+                        {"voiceActivity": {"type": "ACTIVITY_END"}},
+                        {"serverContent": {"outputTranscription": {"text": "hi"}}},
+                        {"serverContent": {"modelTurn": {"parts": [reply]}}},
+                        {"serverContent": {"generationComplete": True}},
+                    ],
+                    6: [
+                        {"voiceActivity": {"type": "ACTIVITY_START"}},
+                        {"serverContent": {"interrupted": True}},
+                        {"serverContent": {"turnComplete": True}, **usage},
+                    ],
+                    8: [
+                        {"voiceActivity": {"type": "ACTIVITY_END"}},
+                        {"serverContent": {"modelTurn": {"parts": [reply]}}},
+                        {"serverContent": {"turnComplete": True}, **usage},
+                    ],
+                }.get(appends, [])
+            else:
+                await websocket.close(1007, "Invalid JSON payload received.")
+                return
+            for server_event in outgoing:
+                await websocket.send(json.dumps(server_event).encode())
+
+
+def gemini(peer: GeminiPeer, variant_dir: Path, **session_args):
+    return asyncio.run(
+        record_session(
+            peer.handler,
+            variant_dir,
+            "gemini-live",
+            turn_detection=SERVER_VAD,
+            **session_args,
+        )
+    )
 
 
 def sent(records, event_type: str) -> list[dict[str, JsonValue]]:
@@ -767,3 +832,98 @@ def test_a_live_session_without_output_audio_does_not_reconstruct(
         "no model output audio"
         in reconstruct_output(tmp_path, profile="openai-live")["errors"]
     )
+
+
+def test_gemini_session_records_model_turns_and_a_barge_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", API_KEY)
+    peer = GeminiPeer()
+    records = gemini(peer, tmp_path)
+
+    report = evaluate_trace(records, profile="gemini-live")
+    assert report["status"] == "pass", report["violations"]
+    assert report["metrics"]["responses_created"] == 2
+    assert report["metrics"]["usage"] == {
+        "promptTokenCount": 14,
+        "responseTokenCount": 6,
+    }
+    assert peer.api_key == API_KEY and peer.authorization is None
+    setup = peer.received[0]["setup"]
+    assert setup["model"] == "models/gemini-3.8-live"
+    assert setup["realtimeInputConfig"]["automaticActivityDetection"] == {
+        "silenceDurationMs": 800
+    }
+    assert b"".join(
+        base64.b64decode(event["realtimeInput"]["audio"]["data"])
+        for event in peer.received[1:]
+    ) == PCM + bytes(round(TAIL_SILENCE_S * INPUT_RATE) * 2)
+
+    received = [
+        record["event"] for record in records if record["direction"] == "receive"
+    ]
+    created = [event for event in received if event["type"] == "response.created"]
+    done = [event["response"] for event in received if event["type"] == "response.done"]
+    first_id, second_id = (event["response"]["id"] for event in created)
+    assert [(response["id"], response["status"]) for response in done] == [
+        (first_id, "cancelled"),
+        (first_id, "cancelled"),
+        (second_id, "completed"),
+    ]
+    transcript = next(
+        event
+        for event in received
+        if event["type"] == "response.output_audio_transcript.delta"
+    )
+    assert transcript["response_id"] is None
+    assert "gemini.generationComplete" in report["metrics"]["server_events"]
+
+    playout = reconstruct_output(tmp_path, profile="gemini-live")
+    reply_samples = round(24000 * REPLY_SECONDS)
+    assert playout["errors"] == []
+    assert playout["media_samples"] == 2 * reply_samples
+    (cut,) = json.loads((tmp_path / "playout.json").read_text())["cuts"]
+    assert cut["type"] == "response.done"
+    assert 0 < cut["dropped_samples"] < reply_samples
+    written = [path for path in tmp_path.rglob("*") if path.is_file()]
+    assert not [path for path in written if API_KEY.encode() in path.read_bytes()]
+
+
+def test_gemini_turn_detection_maps_only_what_activity_detection_has(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", API_KEY)
+    provider = openai_client.Provider.from_env("gemini-live")
+    setup = gemini_configure(
+        provider,
+        TurnDetection(
+            type="server_vad",
+            silence_duration_ms=500,
+            prefix_padding_ms=300,
+            interrupt_response=False,
+        ),
+    )
+    assert setup["realtimeInputConfig"] == {
+        "automaticActivityDetection": {
+            "silenceDurationMs": 500,
+            "prefixPaddingMs": 300,
+        },
+        "activityHandling": "NO_INTERRUPTION",
+    }
+    for turn_detection in (
+        TurnDetection(type="semantic_vad"),
+        TurnDetection(type="server_vad", threshold=0.5),
+    ):
+        with pytest.raises(ValueError):
+            gemini_configure(provider, turn_detection)
+    with pytest.raises(ValueError, match="no truncate"):
+        asyncio.run(
+            run_session(
+                "ws://127.0.0.1:9/unused",
+                PCM,
+                trace_path=Path("unused.jsonl"),
+                profile="gemini-live",
+                turn_detection=SERVER_VAD,
+                report_playback=True,
+            )
+        )

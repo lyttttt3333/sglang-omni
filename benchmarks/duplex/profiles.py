@@ -11,6 +11,7 @@ ProfileName = Literal[
     "turn-based",
     "openai-realtime",
     "openai-live",
+    "gemini-live",
 ]
 DEFAULT_PROFILE: ProfileName = "nemotron-voicechat-pr2188"
 # note (luojiaxuan): "native" is the full-duplex session protocol with sglang.*
@@ -20,7 +21,7 @@ DEFAULT_PROFILE: ProfileName = "nemotron-voicechat-pr2188"
 Protocol = Literal["native", "legacy", "turn_based"]
 # note (wenyao): protocol is the conversation semantics downstream replay branches on;
 # wire is the dialect on the socket, so a commercial API can share a protocol.
-Wire = Literal["sglang", "openai-realtime", "openai-live"]
+Wire = Literal["sglang", "openai-realtime", "openai-live", "gemini-live"]
 # note (wenyao): The received events at which a zero-buffer client stops its playout;
 # speech_started counts only while turn_detection.interrupt_response is not false and
 # response.done only with status cancelled.
@@ -93,5 +94,16 @@ PROFILES: dict[ProfileName, DuplexProfile] = {
         continuous_output=True,
         protocol="native",
         wire="openai-live",
+    ),
+    "gemini-live": DuplexProfile(
+        native_unit_ms=200,
+        output_sample_rate=24000,
+        stop_requires_eos=False,
+        continuous_output=False,
+        protocol="turn_based",
+        wire="gemini-live",
+        # note (jeffro): The server paces its own playout clock and sends interrupted
+        # when a barge-in cuts it, which the client records as a cancelled response.done.
+        playout_cuts=frozenset({"response.done"}),
     ),
 }
