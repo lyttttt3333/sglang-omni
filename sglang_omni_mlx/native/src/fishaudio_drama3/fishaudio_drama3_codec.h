@@ -42,6 +42,9 @@ private:
   static constexpr const char *kPostModule = "quantizer.post_module";
 
   static std::string Index(const std::string &prefix, int index);
+  // The checkpoint's weights, each convolution's as one MLX kernel.
+  static omni_common::WeightMap
+  LoadWeights(const std::filesystem::path &model_directory);
   static mlx::core::array Snake(const mlx::core::array &x,
                                 const mlx::core::array &alpha);
   static mlx::core::array TransformerNorm(const mlx::core::array &x,
@@ -62,7 +65,7 @@ private:
 
   // The layers of the transformer under prefix, as the checkpoint stores them.
   int LayerCount(const std::string &prefix) const;
-  const ConvolutionWeights &Convolution(const std::string &prefix) const;
+  ConvolutionWeights Convolution(const std::string &prefix) const;
   // A whole-sequence causal convolution, NCL in and out.
   mlx::core::array CausalConvolve(const mlx::core::array &x,
                                   const std::string &prefix, int kernel_size,
@@ -88,7 +91,6 @@ private:
                               const std::string &prefix) const;
 
   omni_common::Checkpoint checkpoint_;
-  std::map<std::string, ConvolutionWeights> convolutions_;
 };
 
 // Decodes codes into audio as they arrive; concatenating the audio of

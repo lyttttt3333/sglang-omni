@@ -136,11 +136,6 @@ SpeechJob ParseCommonFields(const Json &body) {
     throw std::invalid_argument("stream=true requires response_format='pcm'");
   } else {
   }
-  const Json speed = PresentFieldOr(body, "speed", Json(1.0));
-  if (!speed.is_number() || speed.get<double>() != 1.0) {
-    throw std::invalid_argument("speed must be 1.0 on this model");
-  } else {
-  }
   return job;
 }
 
@@ -295,8 +290,8 @@ int SpeechServedModel::Speak(mg_connection *connection) {
   while (true) {
     const bool has_audio_or_end = channel->ready.wait_until(
         lock,
-        std::min(deadline,
-                 std::chrono::steady_clock::now() + omni_server::kClientPollInterval),
+        std::min(deadline, std::chrono::steady_clock::now() +
+                               omni_server::kClientPollInterval),
         [&] { return !channel->chunks.empty() || channel->done; });
     if (has_audio_or_end && channel->chunks.empty()) {
       break;

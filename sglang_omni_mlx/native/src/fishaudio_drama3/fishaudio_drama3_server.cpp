@@ -349,6 +349,11 @@ private:
     const std::optional<std::string> model = speech_service::ParseModel(body);
     speech_service::SpeechJob job = speech_service::ParseCommonFields(body);
     job.model = model;
+    const Json speed = PresentFieldOr(body, "speed", Json(1.0));
+    if (!speed.is_number() || speed.get<double>() != 1.0) {
+      throw std::invalid_argument("speed must be 1.0 on this model");
+    } else {
+    }
 
     fishaudio_drama3::Sampling sampling;
     const Json temperature = FieldOr(
@@ -399,6 +404,12 @@ private:
           text, *voice, sampling, max_frames, stream, context.cancel,
           [&](const mlx::core::array &) { context.check_deadline(); },
           context.send);
+      // A chunk may end before its first frame, as in mlx-audio; a request
+      // with no frame at all fails, as on CUDA.
+      if (synthesis.frame_count == 0) {
+        throw std::runtime_error("Drama 3 generated no audio frames");
+      } else {
+      }
       return speech_service::SpeechResult{
           synthesis.finish_reason,
           static_cast<size_t>(synthesis.prompt_row_count),

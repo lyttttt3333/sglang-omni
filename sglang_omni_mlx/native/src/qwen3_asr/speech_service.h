@@ -55,7 +55,7 @@ Json PresentFieldOr(const Json &body, const char *name, Json fallback);
 // The model field; throws std::invalid_argument unless it is a string or
 // null.
 std::optional<std::string> ParseModel(const Json &body);
-// The response_format, stream, stream_format and speed fields, as the CUDA
+// The response_format, stream and stream_format fields, as the CUDA
 // server's CreateSpeechRequest reads them; throws std::invalid_argument.
 SpeechJob ParseCommonFields(const Json &body);
 

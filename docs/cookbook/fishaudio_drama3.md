@@ -376,7 +376,7 @@ Measured on an Apple M4 Max (64 GB), warm, in ABBA order (native, reference, ref
 | Two speakers, cloned voice | 0.376 / 0.375 | 0.375 / 0.370 | 0.19 s | 0.19 s |
 | 26 s passage, two chunks | 0.378 / 0.375 | 0.377 / 0.368 | 0.23 s | 0.22 s |
 
-Loading takes 3.9 to 4.1 s native and 4.4 to 4.6 s for the reference, from a warm file cache. Peak MLX memory (`mx.get_peak_memory()`) is 28.5 GB native on the passage and 28.7 GB in the reference; the server's process footprint stays near 32 GB under mixed load, against 23 GB idle.
+Loading takes 3.9 to 4.1 s native and 4.4 to 4.6 s for the reference, from a warm file cache. Peak MLX memory (`mx.get_peak_memory()`) is 28.2 GB native on the passage and 28.7 GB in the reference; the server's process footprint stays near 32 GB under mixed load, against 23 GB idle.
 
 The 8-bit checkpoint, measured the same way:
 

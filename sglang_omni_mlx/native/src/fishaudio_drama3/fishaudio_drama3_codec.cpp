@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <set>
 #include <stdexcept>
 #include <string_view>
@@ -24,8 +25,12 @@ constexpr float kConvNeXtNormEps = 1e-6f;
 constexpr float kMaskedScore = -1e9f;
 constexpr const char *kEncoderTransformer = "encoder.block.4.block.5";
 constexpr const char *kPreModule = "quantizer.pre_module";
-constexpr const char *kWeightNormG = ".conv.parametrizations.weight.original0";
-constexpr const char *kWeightNormV = ".conv.parametrizations.weight.original1";
+// The (g, v) name suffixes of a weight-normed convolution: parametrized, or
+// the older weight_g and weight_v.
+constexpr std::pair<std::string_view, std::string_view> kWeightNormSuffixes[] =
+    {{".conv.parametrizations.weight.original0",
+      ".conv.parametrizations.weight.original1"},
+     {".weight_g", ".weight_v"}};
 
 // Rotates the pairs of x [batch, time, heads, dim] by freqs_cis [time, dim / 2,
 // 2].
@@ -52,31 +57,6 @@ mx::array ApplyRotary(const mx::array &x, const mx::array &freqs_cis) {
                  mx::add(mx::multiply(x1, cosine), mx::multiply(x0, sine))},
                 -1);
   return mx::astype(mx::reshape(rotated, x.shape()), x.dtype());
-}
-
-omni_common::WeightMap
-LoadCodecWeights(const std::filesystem::path &model_directory) {
-  auto [loaded, metadata] =
-      mx::load_safetensors((model_directory / "codec.safetensors").string());
-  omni_common::WeightMap weights;
-  for (auto &[name, array] : loaded) {
-    const std::string_view weight_norm_g = kWeightNormG;
-    const std::string_view weight_norm_v = kWeightNormV;
-    if (name.ends_with(".causal_mask")) {
-      continue;
-    } else if (name.ends_with(weight_norm_g)) {
-      weights.insert_or_assign(
-          name.substr(0, name.size() - weight_norm_g.size()) + ".weight_g",
-          array);
-    } else if (name.ends_with(weight_norm_v)) {
-      weights.insert_or_assign(
-          name.substr(0, name.size() - weight_norm_v.size()) + ".weight_v",
-          array);
-    } else {
-      weights.insert_or_assign(name, array);
-    }
-  }
-  return weights;
 }
 
 } // namespace
@@ -159,8 +139,16 @@ mx::array AudioCodec::WindowMask(int query_begin, int total, int window,
       {0, 1});
 }
 
-AudioCodec::AudioCodec(const std::filesystem::path &model_directory)
-    : checkpoint_(LoadCodecWeights(model_directory), nlohmann::json::object()) {
+// The codec's weights, each convolution's kernel stored once as
+// prefix.kernel: weight norm folded as g * v / |v| over all but the first
+// axis, moved from PyTorch to MLX layout.
+// Note (Yitong Li): the fold keeps the reference's operation order, which
+// Voxtral's differs from, for bit-identical audio.
+omni_common::WeightMap
+AudioCodec::LoadWeights(const std::filesystem::path &model_directory) {
+  auto [loaded, metadata] =
+      mx::load_safetensors((model_directory / "codec.safetensors").string());
+  const std::string_view plain_kernel = ".conv.weight";
   std::set<std::string> transposed_prefixes;
   for (int block = 0; block < kDownsampleCount; ++block) {
     transposed_prefixes.insert(Index("quantizer.upsample", block) + ".0");
@@ -168,59 +156,61 @@ AudioCodec::AudioCodec(const std::filesystem::path &model_directory)
   for (int block = 0; block < 4; ++block) {
     transposed_prefixes.insert(Index("decoder.model", block + 1) + ".block.1");
   }
-  // Every convolution's kernel, weight norm folded as g * v / |v| over all
-  // but the first axis, moved from PyTorch to MLX layout.
-  // Note (Yitong Li): the fold keeps the reference's operation order, which
-  // Voxtral's differs from, for bit-identical audio.
-  std::vector<mx::array> kernels;
-  for (const auto &[name, array] : checkpoint_.weights()) {
-    std::string prefix;
-    bool is_weight_norm = false;
-    if (name.ends_with(".weight_v")) {
-      prefix = name.substr(0, name.size() - std::string(".weight_v").size());
-      is_weight_norm = true;
-    } else if (name.ends_with(".conv.weight") && array.ndim() == 3) {
-      prefix = name.substr(0, name.size() - std::string(".conv.weight").size());
-    } else {
+  // Transposed convolutions store [in, out, kernel]; the rest [out, in,
+  // kernel].
+  const auto to_mlx_layout = [&transposed_prefixes](const std::string &prefix,
+                                                    const mx::array &kernel) {
+    return transposed_prefixes.count(prefix) ? mx::transpose(kernel, {1, 2, 0})
+                                             : mx::transpose(kernel, {0, 2, 1});
+  };
+  omni_common::WeightMap weights;
+  for (auto &[name, array] : loaded) {
+    const auto weight_norm = std::find_if(
+        std::begin(kWeightNormSuffixes), std::end(kWeightNormSuffixes),
+        [&name](const auto &suffixes) {
+          return name.ends_with(suffixes.first) ||
+                 name.ends_with(suffixes.second);
+        });
+    if (name.ends_with(".causal_mask") ||
+        (weight_norm != std::end(kWeightNormSuffixes) &&
+         name.ends_with(weight_norm->first))) {
       continue;
-    }
-    mx::array kernel = array;
-    if (is_weight_norm) {
-      const mx::array &g = checkpoint_.Weight(prefix + ".weight_g");
-      kernel = mx::divide(
+    } else if (weight_norm != std::end(kWeightNormSuffixes)) {
+      const std::string prefix =
+          name.substr(0, name.size() - weight_norm->second.size());
+      const mx::array &g = loaded.at(prefix + std::string(weight_norm->first));
+      const mx::array kernel = mx::divide(
           mx::multiply(g, array),
           mx::sqrt(
               mx::sum(mx::power(array, omni_common::Scalar(2, array.dtype())),
                       {1, 2}, true)));
+      weights.insert_or_assign(prefix + ".kernel",
+                               to_mlx_layout(prefix, kernel));
+    } else if (name.ends_with(plain_kernel) && array.ndim() == 3) {
+      const std::string prefix =
+          name.substr(0, name.size() - plain_kernel.size());
+      weights.insert_or_assign(prefix + ".kernel",
+                               to_mlx_layout(prefix, array));
     } else {
+      weights.insert_or_assign(name, array);
     }
-    // Transposed convolutions store [in, out, kernel]; the rest [out, in,
-    // kernel].
-    kernel = transposed_prefixes.count(prefix)
-                 ? mx::transpose(kernel, {1, 2, 0})
-                 : mx::transpose(kernel, {0, 2, 1});
-    const std::string bias_name = checkpoint_.Has(prefix + ".bias")
-                                      ? prefix + ".bias"
-                                      : prefix + ".conv.bias";
-    std::optional<mx::array> bias = std::nullopt;
-    if (checkpoint_.Has(bias_name)) {
-      bias = checkpoint_.Weight(bias_name);
-    } else {
-    }
-    convolutions_.insert_or_assign(prefix, ConvolutionWeights{kernel, bias});
-    kernels.push_back(kernel);
   }
-  mx::eval(kernels);
+  return weights;
 }
 
-const ConvolutionWeights &
-AudioCodec::Convolution(const std::string &prefix) const {
-  const auto found = convolutions_.find(prefix);
-  if (found == convolutions_.end()) {
-    throw std::runtime_error("codec checkpoint is missing " + prefix);
+AudioCodec::AudioCodec(const std::filesystem::path &model_directory)
+    : checkpoint_(LoadWeights(model_directory), nlohmann::json::object()) {}
+
+ConvolutionWeights AudioCodec::Convolution(const std::string &prefix) const {
+  const std::string bias_name = checkpoint_.Has(prefix + ".bias")
+                                    ? prefix + ".bias"
+                                    : prefix + ".conv.bias";
+  std::optional<mx::array> bias = std::nullopt;
+  if (checkpoint_.Has(bias_name)) {
+    bias = checkpoint_.Weight(bias_name);
   } else {
   }
-  return found->second;
+  return ConvolutionWeights{checkpoint_.Weight(prefix + ".kernel"), bias};
 }
 
 mx::array AudioCodec::CausalConvolve(const mx::array &x,

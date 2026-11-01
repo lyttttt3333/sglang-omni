@@ -153,6 +153,11 @@ private:
     }
     speech_service::SpeechJob job = speech_service::ParseCommonFields(body);
     job.model = model;
+    const Json speed = PresentFieldOr(body, "speed", Json(1.0));
+    if (!speed.is_number() || speed.get<double>() != 1.0) {
+      throw std::invalid_argument("speed must be 1.0 on this model");
+    } else {
+    }
     const Json max_new_tokens =
         FieldOr(body, "max_new_tokens", Json(kMaxAudioFrames));
     if (!max_new_tokens.is_number_integer()) {
