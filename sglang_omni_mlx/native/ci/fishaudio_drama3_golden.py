@@ -7,7 +7,7 @@ reference's length set them, since the tool writes a reference's audio rows as -
 
 A golden file of kind fishaudio_drama3 names its cases (text, seed, max_new_tokens,
 optional sampling fields, and an optional reference: its transcript with either a
-WAV in this directory or one string of codes per codebook). Outputs are compared as
+voice provision.py prepares or one string of codes per codebook). Outputs are compared as
 speech_golden.py compares them, the PCM's SHA-256 included.
 """
 
@@ -20,9 +20,9 @@ import tempfile
 import wave
 from pathlib import Path
 
+from provision import VOICE_DIRECTORY
 from speech_golden import SpeechCase, SpeechOutputs, joined
 
-CI_DIRECTORY = Path(__file__).resolve().parent
 SAMPLING_FIELDS = ("temperature", "top_p", "top_k")
 
 
@@ -58,7 +58,8 @@ def synthesize(
         elif "audio" in reference:
             command += [
                 "--reference-audio",
-                str(CI_DIRECTORY / reference["audio"]),
+                # model_directory is <data root>/models/<repo>, beside the voices.
+                str(model_directory.parents[1] / VOICE_DIRECTORY / reference["audio"]),
                 "--reference-text",
                 reference["text"],
             ]

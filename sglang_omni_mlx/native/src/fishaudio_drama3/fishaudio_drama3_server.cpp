@@ -34,6 +34,7 @@
 #include "common/audio.h"
 #include "common/text.h"
 #include "fishaudio_drama3/fishaudio_drama3_model.h"
+#include "fishaudio_drama3/fishaudio_drama3_prompt.h"
 #include "fishaudio_drama3/fishaudio_drama3_text.h"
 #include "qwen3_asr/asr_service.h"
 #include "qwen3_asr/speech_service.h"
@@ -119,48 +120,6 @@ std::vector<float> DecodeReferenceAudio(const std::string &encoded,
   } else {
   }
   return samples;
-}
-
-// A reference's codes [codebooks][frames], built here as plain integers so
-// that only the worker thread makes MLX arrays.
-std::vector<std::vector<int32_t>> ReferenceCodes(const Json &vq_codes,
-                                                 int codebook_count,
-                                                 int codebook_size,
-                                                 const std::string &location) {
-  const std::string shape_error = location + ".vq_codes must be a [" +
-                                  std::to_string(codebook_count) +
-                                  ", frames] grid of integers";
-  if (!vq_codes.is_array() ||
-      vq_codes.size() != static_cast<size_t>(codebook_count) ||
-      !vq_codes.at(0).is_array() || vq_codes.at(0).empty()) {
-    throw std::invalid_argument(shape_error);
-  } else if (vq_codes.at(0).size() > kMaxReferenceFrames) {
-    throw std::invalid_argument(location + ".vq_codes must have at most " +
-                                std::to_string(kMaxReferenceFrames) +
-                                " frames");
-  } else {
-  }
-  const size_t frame_count = vq_codes.at(0).size();
-  std::vector<std::vector<int32_t>> codes;
-  for (const Json &row : vq_codes) {
-    if (!row.is_array() || row.size() != frame_count) {
-      throw std::invalid_argument(shape_error);
-    } else {
-    }
-    std::vector<int32_t> &codebook = codes.emplace_back();
-    for (const Json &code : row) {
-      if (!code.is_number_integer()) {
-        throw std::invalid_argument(shape_error);
-      } else if (code.get<int64_t>() < 0 ||
-                 code.get<int64_t>() >= codebook_size) {
-        throw std::invalid_argument(location + ".vq_codes must be in [0, " +
-                                    std::to_string(codebook_size) + ")");
-      } else {
-      }
-      codebook.push_back(code.get<int32_t>());
-    }
-  }
-  return codes;
 }
 
 // A reference's transcript, given in field, checked against the prompt's
@@ -250,8 +209,9 @@ private:
         }
       }
       if (!vq_codes.is_null()) {
-        input.codes = ReferenceCodes(vq_codes, model_.codebook_count(),
-                                     model_.codebook_size(), location);
+        input.codes = fishaudio_drama3::ReferenceCodes(
+            vq_codes, model_.codebook_count(), model_.codebook_size(),
+            kMaxReferenceFrames, location);
       } else if (data.is_string()) {
         input.samples = DecodeReferenceAudio(data.get<std::string>(), location);
       } else if (audio_url.has_value()) {

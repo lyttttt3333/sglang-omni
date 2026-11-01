@@ -30,6 +30,7 @@
 
 #include "common/audio.h"
 #include "fishaudio_drama3/fishaudio_drama3_model.h"
+#include "fishaudio_drama3/fishaudio_drama3_prompt.h"
 #include "fishaudio_drama3/fishaudio_drama3_text.h"
 #include "nlohmann/json.hpp"
 
@@ -181,20 +182,16 @@ int Run(int argc, char **argv) {
   for (size_t index = 0; index < reference_paths.size(); ++index) {
     const auto &[path, is_codes] = reference_paths[index];
     if (is_codes) {
-      const nlohmann::json grid = nlohmann::json::parse(ReadFile(path));
-      std::vector<std::vector<int32_t>> codes;
-      for (const nlohmann::json &codebook : grid) {
-        std::vector<int32_t> &row = codes.emplace_back();
-        for (const nlohmann::json &code : codebook) {
-          if (!code.is_number_unsigned() ||
-              code.get<uint64_t>() > std::numeric_limits<int32_t>::max()) {
-            throw UsageError(path + " must hold non-negative integer codes");
-          } else {
-          }
-          row.push_back(code.get<int32_t>());
-        }
+      try {
+        references.push_back({reference_texts[index],
+                              {},
+                              fishaudio_drama3::ReferenceCodes(
+                                  nlohmann::ordered_json::parse(ReadFile(path)),
+                                  model.codebook_count(), model.codebook_size(),
+                                  std::numeric_limits<size_t>::max(), path)});
+      } catch (const std::invalid_argument &error) {
+        throw UsageError(error.what());
       }
-      references.push_back({reference_texts[index], {}, codes});
     } else {
       std::vector<float> samples = omni_common::DecodeWav(
           ReadFile(path), fishaudio_drama3::kCodecSampleRate);
@@ -222,7 +219,6 @@ int Run(int argc, char **argv) {
   const fishaudio_drama3::PromptFrames first_prompt =
       fishaudio_drama3::BuildFrames(model.tokenizer(), voice->references, {},
                                     chunks.front(), model.codebook_count(),
-                                    model.codebook_size(),
                                     model.semantic_begin());
   const mlx::core::array prompt_column = mlx::core::contiguous(
       mlx::core::reshape(mlx::core::slice(first_prompt.frames, {0, 0},

@@ -143,10 +143,10 @@ mx::array Checkpoint::Linear(const mx::array &x,
         Has(prefix + ".biases")
             ? std::optional<mx::array>(Weight(prefix + ".biases"))
             : std::nullopt;
+    const QuantizationConfig &quantization = Quantization(prefix);
     mx::array y = mx::quantized_matmul(
         x, Weight(prefix + ".weight"), Weight(prefix + ".scales"), biases, true,
-        Quantization(prefix).group_size, Quantization(prefix).bits,
-        Quantization(prefix).mode);
+        quantization.group_size, quantization.bits, quantization.mode);
     if (Has(prefix + ".bias")) {
       return mx::add(y, Weight(prefix + ".bias"));
     } else {
@@ -178,10 +178,11 @@ mx::array Checkpoint::Embed(const mx::array &ids,
         Has(prefix + ".biases") ? std::optional<mx::array>(mx::take(
                                       Weight(prefix + ".biases"), ids, 0))
                                 : std::nullopt;
+    const QuantizationConfig &quantization = Quantization(prefix);
     return mx::dequantize(mx::take(Weight(prefix + ".weight"), ids, 0),
                           mx::take(Weight(prefix + ".scales"), ids, 0), biases,
-                          Quantization(prefix).group_size,
-                          Quantization(prefix).bits, Quantization(prefix).mode);
+                          quantization.group_size, quantization.bits,
+                          quantization.mode);
   } else {
     return mx::take(Weight(prefix + ".weight"), ids, 0);
   }
@@ -194,10 +195,10 @@ mx::array Checkpoint::TiedProjection(const mx::array &x,
         Has(prefix + ".biases")
             ? std::optional<mx::array>(Weight(prefix + ".biases"))
             : std::nullopt;
+    const QuantizationConfig &quantization = Quantization(prefix);
     return mx::quantized_matmul(
         x, Weight(prefix + ".weight"), Weight(prefix + ".scales"), biases, true,
-        Quantization(prefix).group_size, Quantization(prefix).bits,
-        Quantization(prefix).mode);
+        quantization.group_size, quantization.bits, quantization.mode);
   } else {
     return mx::matmul(x, mx::transpose(Weight(prefix + ".weight")));
   }

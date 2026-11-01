@@ -322,11 +322,6 @@ Drama3Model::GetVoice(const std::vector<ReferenceInput> &references) {
       mx::clear_cache();
     }
   }
-  // The prompt checks the codes before any is cached.
-  for (size_t index = 0; index < voice->references.size(); ++index) {
-    CheckCodes(voice->references[index].codes, codebook_count_, codebook_size_,
-               "reference " + std::to_string(index + 1));
-  }
   voices_.emplace_front(reference_key, voice);
   while (voices_.size() > kVoiceCacheSize) {
     voices_.pop_back();
@@ -339,7 +334,6 @@ SynthesisResult Drama3Model::Synthesize(
     int max_frames, bool stream, const std::atomic<bool> &cancel,
     const std::function<void(const mx::array &)> &on_frame,
     const std::function<void(std::vector<float>)> &on_audio) {
-  ValidateText(text, "text");
   const std::vector<std::string> chunks = SplitText(text);
   CodecStream codec_stream(codec_);
   const auto decode = [&](const std::vector<mx::array> &codes, size_t begin,
@@ -370,9 +364,9 @@ SynthesisResult Drama3Model::Synthesize(
         } else {
         }
       }
-      const PromptFrames prompt = BuildFrames(
-          tokenizer_, voice.references, history, chunks[chunk_index],
-          codebook_count_, codebook_size_, semantic_begin_);
+      const PromptFrames prompt =
+          BuildFrames(tokenizer_, voice.references, history,
+                      chunks[chunk_index], codebook_count_, semantic_begin_);
       result.prompt_row_count += prompt.frames.shape(0);
       std::vector<mx::array> codes;
       size_t emitted = 0;

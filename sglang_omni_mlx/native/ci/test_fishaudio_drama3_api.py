@@ -19,6 +19,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from provision import VOICE_DIRECTORY
 from speech_api import (
     open_speech_stream,
     request_states,
@@ -55,9 +56,6 @@ MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024
 CANCEL_SECONDS = 8.0
 # The most frames a reference's codes may hold: 30 s of audio.
 MAX_REFERENCE_FRAMES = 646
-VOICE_WAV = (
-    Path(__file__).resolve().parent / "fishaudio_drama3_voice.wav"
-).read_bytes()
 VOICE_TEXT = "We asked over twenty different people, and they all said it was his."
 GOLDEN_PATH = (
     Path(__file__).resolve().parent / "model_golden" / "fish-audio-drama-3-4bit.json"
@@ -129,7 +127,10 @@ def test_drama3_clones_a_reference_voice(
 ) -> None:
     """Both reference forms give the same prompt: the transcript and the frames
     of the reference audio, then the input."""
-    encoded = base64.b64encode(VOICE_WAV).decode()
+    voice_wav = (
+        Path(DATA_ROOT) / VOICE_DIRECTORY / "fishaudio_drama3_voice.wav"
+    ).read_bytes()
+    encoded = base64.b64encode(voice_wav).decode()
     listed_body = {
         "input": CLONED_SENTENCE,
         "references": [{"data": encoded, "text": VOICE_TEXT}],
@@ -141,7 +142,7 @@ def test_drama3_clones_a_reference_voice(
     }
     status, headers, audio = speak(drama3_server, listed_body)
     assert status == 200
-    assert int(headers["X-Prompt-Tokens"]) > len(pcm_of(VOICE_WAV)) // FRAME_BYTES
+    assert int(headers["X-Prompt-Tokens"]) > len(pcm_of(voice_wav)) // FRAME_BYTES
     url_status, url_headers, _ = speak(drama3_server, url_body)
     assert (url_status, url_headers["X-Prompt-Tokens"]) == (
         200,
