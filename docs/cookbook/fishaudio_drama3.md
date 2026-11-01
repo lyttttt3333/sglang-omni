@@ -352,11 +352,9 @@ The server reads the request fields the CUDA server reads and refuses the same u
 
 `fishaudio_drama3_synthesize` runs one request from the command line and prints its timings; with `--codes-output` it also writes the first chunk's prompt ids and every frame's codes, for parity checks.
 
-### Reference parity and Mac CI
+### Reference parity and performance
 
-The numerical reference is mlx-audio 0.6.2 (`f6d5da9`: `mlx_audio/tts/models/fish_drama3` and `mlx_audio/codec/models/fish_s1_dac`) on the same checkpoint and MLX 0.32.3; `native/licenses/fishaudio_drama3-MIT.txt` holds its license. The native runtime runs the gated delta rule on MLX's `mx::fast::gated_delta_update`, where mlx-audio runs its own Metal kernel, and the two round their bf16 outputs differently. With mlx-audio's gated delta step on the same MLX primitive and the same seed (given to `fishaudio_drama3_synthesize`), the native runtime samples the same codes and decodes the same PCM16 samples on every golden case.
-
-Mac CI checks the same seeded requests against `native/ci/model_golden/fish-audio-drama-3-4bit.json` (codes and a hash of the decoded audio; English, Chinese, codes and audio references, two speakers, low-temperature sampling, a frame cap and a three-chunk passage) on a runner with at least 48 GB of unified memory, and runs the server API tests in `native/ci/test_fishaudio_drama3_api.py`. Mac CI does not run the 8-bit checkpoint; `fish-audio-drama-3-8bit.json` holds the same cases for it, for `check_model_golden.py` on a 64 GB Mac. The voice clip both use is the Common Voice clip (CC0) the cloning example above uses: `native/ci/provision.py` downloads it and resamples it from 24 kHz to 44.1 kHz with `scipy.signal.resample_poly`.
+The numerical reference is mlx-audio 0.6.2 (`f6d5da9`: `mlx_audio/tts/models/fish_drama3` and `mlx_audio/codec/models/fish_s1_dac`) on the same checkpoint and MLX 0.32.3; `native/licenses/fishaudio_drama3-MIT.txt` holds its license. The native runtime runs the gated delta rule on MLX's `mx::fast::gated_delta_update`, where mlx-audio runs its own Metal kernel, and the two round their bf16 outputs differently. With mlx-audio's gated delta step on the same MLX primitive and the same seed (given to `fishaudio_drama3_synthesize`), the native runtime samples the same codes and decodes the same PCM16 samples on every seeded test request.
 
 Measured on an Apple M4 Max (64 GB), warm, in ABBA order (native, reference, reference, native). The server takes no seed, so each side ran each request three times; the table gives each round's median real-time factor (generation time over audio duration) and the median time to the first streamed audio. Native times include the HTTP request and PCM encoding. The 4-bit checkpoint:
 

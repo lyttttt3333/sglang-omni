@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <algorithm>
 #include <stdexcept>
+#include <vector>
 
 #include "fishaudio_drama3/fishaudio_drama3_codec.h"
 
@@ -18,8 +19,8 @@ mx::array CodecStream::CausalStep(const mx::array &x, const std::string &prefix,
                 ? mx::pad(x, {{0, 0}, {0, 0}, {padding, 0}})
                 : mx::concatenate({found->second, x}, -1);
     left_contexts_.insert_or_assign(
-        prefix,
-        AudioCodec::SliceTime(input, input.shape(2) - padding, input.shape(2)));
+        prefix, mx::contiguous(AudioCodec::SliceTime(
+                    input, input.shape(2) - padding, input.shape(2))));
   } else {
   }
   return AudioCodec::Convolve(input, codec_.Convolution(prefix), 1, dilation,
@@ -47,8 +48,8 @@ mx::array CodecStream::TransposedStep(const mx::array &x,
   } else {
   }
   if (y.shape(2) > valid) {
-    overlaps_.insert_or_assign(prefix,
-                               AudioCodec::SliceTime(y, valid, y.shape(2)));
+    overlaps_.insert_or_assign(
+        prefix, mx::contiguous(AudioCodec::SliceTime(y, valid, y.shape(2))));
   } else {
   }
   return AudioCodec::SliceTime(y, 0, valid);
@@ -172,7 +173,16 @@ mx::array CodecStream::Push(const mx::array &codes) {
   }
   x = AudioCodec::Snake(x, codec_.checkpoint_.Weight("decoder.model.5.alpha"));
   x = mx::tanh(CausalStep(x, "decoder.model.6", 7, 1, 1));
-  return mx::reshape(x, {frames * kCodecFrameSamples});
+  std::vector<mx::array> convolution_states;
+  convolution_states.reserve(left_contexts_.size() + overlaps_.size());
+  for (const auto &cached_context : left_contexts_) {
+    convolution_states.push_back(cached_context.second);
+  }
+  for (const auto &cached_overlap : overlaps_) {
+    convolution_states.push_back(cached_overlap.second);
+  }
+  return mx::depends({mx::reshape(x, {frames * kCodecFrameSamples})},
+                     convolution_states)[0];
 }
 
 } // namespace fishaudio_drama3
