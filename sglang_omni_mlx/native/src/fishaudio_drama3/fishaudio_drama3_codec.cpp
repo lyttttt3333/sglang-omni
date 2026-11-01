@@ -199,18 +199,32 @@ AudioCodec::LoadWeights(const std::filesystem::path &model_directory) {
 }
 
 AudioCodec::AudioCodec(const std::filesystem::path &model_directory)
-    : checkpoint_(LoadWeights(model_directory), nlohmann::json::object()) {}
+    : AudioCodec(LoadWeights(model_directory)) {}
 
-ConvolutionWeights AudioCodec::Convolution(const std::string &prefix) const {
-  const std::string bias_name = checkpoint_.Has(prefix + ".bias")
-                                    ? prefix + ".bias"
-                                    : prefix + ".conv.bias";
-  std::optional<mx::array> bias = std::nullopt;
-  if (checkpoint_.Has(bias_name)) {
-    bias = checkpoint_.Weight(bias_name);
-  } else {
+AudioCodec::AudioCodec(omni_common::WeightMap weights)
+    : checkpoint_(weights, nlohmann::json::object()) {
+  const std::string_view kernel_suffix = ".kernel";
+  for (const auto &[name, kernel] : weights) {
+    if (name.ends_with(kernel_suffix)) {
+      const std::string prefix =
+          name.substr(0, name.size() - kernel_suffix.size());
+      const std::string bias_name = checkpoint_.Has(prefix + ".bias")
+                                        ? prefix + ".bias"
+                                        : prefix + ".conv.bias";
+      std::optional<mx::array> bias = std::nullopt;
+      if (checkpoint_.Has(bias_name)) {
+        bias = checkpoint_.Weight(bias_name);
+      } else {
+      }
+      convolutions_.insert_or_assign(prefix, ConvolutionWeights{kernel, bias});
+    } else {
+    }
   }
-  return ConvolutionWeights{checkpoint_.Weight(prefix + ".kernel"), bias};
+}
+
+const ConvolutionWeights &
+AudioCodec::Convolution(const std::string &prefix) const {
+  return convolutions_.at(prefix);
 }
 
 mx::array AudioCodec::CausalConvolve(const mx::array &x,

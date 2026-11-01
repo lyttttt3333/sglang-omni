@@ -13,8 +13,8 @@ from typing import NotRequired, Required, TypedDict
 
 
 class SpeechReference(TypedDict, total=False):
-    """A voice to clone: its transcript, and a WAV provision.py prepares or one
-    string of codes per codebook."""
+    """A voice to clone: its transcript, and a WAV in the data root's voices
+    directory or one string of codes per codebook."""
 
     text: Required[str]
     audio: str

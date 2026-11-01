@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Prepares a CI data root: pinned model checkpoints, the frozen corpus and the
-voices the speech models clone.
+"""Prepares a CI data root: pinned model checkpoints and the frozen corpus.
 
 Every file is checked against its recorded SHA-256, so a runner's cache is
 reused only when it matches what the golden files were made from.
@@ -16,11 +15,7 @@ import subprocess
 import sys
 import tarfile
 import urllib.request
-from math import gcd
 from pathlib import Path
-
-import soundfile
-from scipy.signal import resample_poly
 
 CI_DIRECTORY = Path(__file__).resolve().parent
 CORPUS_SOURCES = {
@@ -30,13 +25,6 @@ CORPUS_SOURCES = {
     "ascend-test.parquet": "https://huggingface.co/datasets/CAiRE/ASCEND/resolve/main/main/test-00000-of-00001.parquet",
 }
 DOWNLOAD_CHUNK_BYTES = 1 << 20
-# The voice Drama 3's goldens and API tests clone: the Common Voice clip (CC0)
-# the CUDA cookbook clones, resampled to the Fish S1 DAC codec's 44.1 kHz.
-VOICE_SOURCE = "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/0df0b57b45253d5a9fa0b0e98846642f235f828e/en/prompt-wavs/common_voice_en_10119832.wav"
-VOICE_SOURCE_SHA256 = "af3ac928e98cdb171c9abdc611813f2cc40c52b71167790b785628104f81f389"
-VOICE_SHA256 = "df436ec78ec5b99cb16d4ca91057148bb490ac58715da6e49ce22ffa070f643b"
-VOICE_SAMPLE_RATE = 44100
-VOICE_DIRECTORY = "voices"
 
 
 def sha256(path: Path) -> str:
@@ -141,29 +129,6 @@ def provision_corpus(data_root: Path) -> Path:
     return corpus_directory
 
 
-def provision_voice(data_root: Path) -> Path:
-    voice = data_root / VOICE_DIRECTORY / "fishaudio_drama3_voice.wav"
-    if voice.exists() and sha256(voice) == VOICE_SHA256:
-        return voice
-    else:
-        pass
-    source = data_root / VOICE_DIRECTORY / "common_voice_en_10119832.wav"
-    download(VOICE_SOURCE, source, VOICE_SOURCE_SHA256)
-    samples, source_rate = soundfile.read(source, dtype="float64")
-    step = gcd(VOICE_SAMPLE_RATE, source_rate)
-    soundfile.write(
-        voice,
-        resample_poly(samples, VOICE_SAMPLE_RATE // step, source_rate // step),
-        VOICE_SAMPLE_RATE,
-        subtype="PCM_16",
-    )
-    if sha256(voice) != VOICE_SHA256:
-        raise SystemExit(f"{voice} does not match the pinned {VOICE_SHA256}")
-    else:
-        pass
-    return voice
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("data_root", type=Path)
@@ -178,7 +143,6 @@ def main() -> None:
             flush=True,
         )
     print(f"corpus: {provision_corpus(arguments.data_root)}", flush=True)
-    print(f"voice: {provision_voice(arguments.data_root)}", flush=True)
 
 
 if __name__ == "__main__":

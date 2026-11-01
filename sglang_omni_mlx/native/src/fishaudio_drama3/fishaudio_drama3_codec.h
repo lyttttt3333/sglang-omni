@@ -7,6 +7,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -33,6 +34,8 @@ public:
 
 private:
   friend class CodecStream;
+
+  explicit AudioCodec(omni_common::WeightMap weights);
 
   static constexpr int kDecoderStrides[] = {8, 8, 4, 2};
   static constexpr int kResidualDilations[] = {1, 3, 9};
@@ -65,7 +68,7 @@ private:
 
   // The layers of the transformer under prefix, as the checkpoint stores them.
   int LayerCount(const std::string &prefix) const;
-  ConvolutionWeights Convolution(const std::string &prefix) const;
+  const ConvolutionWeights &Convolution(const std::string &prefix) const;
   // A whole-sequence causal convolution, NCL in and out.
   mlx::core::array CausalConvolve(const mlx::core::array &x,
                                   const std::string &prefix, int kernel_size,
@@ -91,6 +94,8 @@ private:
                               const std::string &prefix) const;
 
   omni_common::Checkpoint checkpoint_;
+  // Each convolution's weights by prefix, sharing checkpoint_'s arrays.
+  std::unordered_map<std::string, ConvolutionWeights> convolutions_;
 };
 
 // Decodes codes into audio as they arrive; concatenating the audio of
