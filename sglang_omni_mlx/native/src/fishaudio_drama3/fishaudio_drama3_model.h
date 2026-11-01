@@ -141,12 +141,14 @@ private:
 
   struct Step {
     mlx::core::array frame;
+    mlx::core::array frame_codes;
     mlx::core::array hidden;
     mlx::core::array history;
     mlx::core::array main_token;
   };
-  // One frame, all lazy: the frame [1, 1, 1 + codebooks], the next hidden
-  // state, the main-token history and the main token [1].
+  // One frame, all lazy: the frame [1, 1, 1 + codebooks], its codes
+  // [codebooks], the next hidden state, the main-token history and the main
+  // token [1].
   Step DecodeStep(const mlx::core::array &hidden, const mlx::core::array &frame,
                   const mlx::core::array &history, ModelCaches &caches,
                   const Sampling &sampling) const;

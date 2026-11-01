@@ -193,10 +193,12 @@ Drama3Model::Step Drama3Model::DecodeStep(const mx::array &hidden,
   }
   const mx::array new_frame =
       mx::astype(mx::expand_dims(mx::concatenate(columns, -1), 1), mx::int32);
+  const mx::array frame_codes = mx::reshape(
+      SliceLast(new_frame, 1, 1 + codebook_count_), {codebook_count_});
   const mx::array next_hidden = Backbone(Embed(new_frame), caches.backbone);
   const mx::array next_history =
       mx::concatenate({SliceAxis(history, 0, 1, history.shape(0)), main_token});
-  return {new_frame, next_hidden, next_history, main_token};
+  return {new_frame, frame_codes, next_hidden, next_history, main_token};
 }
 
 bool Drama3Model::GenerateChunk(
@@ -227,8 +229,8 @@ bool Drama3Model::GenerateChunk(
   // only touches this chunk's caches, and draws its random keys as the
   // reference does.
   Step pending = DecodeStep(hidden, last_row, history, caches, sampling);
-  mx::async_eval(
-      {pending.frame, pending.hidden, pending.history, pending.main_token});
+  mx::async_eval({pending.frame, pending.frame_codes, pending.hidden,
+                  pending.history, pending.main_token});
   // Note (Yitong Li): a turn often ends with <|semantic:0|> right before the
   // end; that frame decodes to a click, so it is held back one step and
   // dropped at the end.
@@ -242,8 +244,8 @@ bool Drama3Model::GenerateChunk(
     if (frame_index + 1 < max_frames) {
       pending = DecodeStep(current.hidden, current.frame, current.history,
                            caches, sampling);
-      mx::async_eval(
-          {pending.frame, pending.hidden, pending.history, pending.main_token});
+      mx::async_eval({pending.frame, pending.frame_codes, pending.hidden,
+                      pending.history, pending.main_token});
     } else {
     }
     const int token = current.main_token.item<int>();
@@ -255,9 +257,7 @@ bool Drama3Model::GenerateChunk(
       on_frame(*held);
     } else {
     }
-    held = mx::reshape(SliceLast(current.frame, 1, 1 + codebook_count_),
-                       {codebook_count_});
-    mx::eval(*held);
+    held = current.frame_codes;
     if (token != semantic_begin_) {
       on_frame(*held);
       held = std::nullopt;
